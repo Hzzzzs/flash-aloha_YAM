@@ -113,6 +113,11 @@ class YAMController:
         self.max_temperature_c = float(max_temperature_c)
         self.command_timeout_s = float(command_timeout_s)
         self.clock = clock
+        self._gripper_friction = None
+        self._gripper_assist_enabled = False
+        self._gripper_position_control = True
+        self._assist_deadline = None
+        self._assist_torque = 0.0
         self._base_kp = np.asarray(robot._kp, dtype=float).copy()
         self._base_kd = np.asarray(robot._kd, dtype=float).copy()
         self._passive_kd = np.asarray(robot._grav_comp_kd, dtype=float).copy()
@@ -140,6 +145,8 @@ class YAMController:
             raise RuntimeError(f"YAM {self.role} expected seven feedback values")
         if not np.isfinite(qpos).all() or not np.isfinite(qvel).all():
             raise RuntimeError(f"YAM {self.role} returned non-finite feedback")
+        if self._gripper_assist_enabled:
+            self._assist_deadline = self.clock() + self.command_timeout_s
         return qpos, qvel, timestamp
 
     @staticmethod
@@ -152,6 +159,8 @@ class YAMController:
         return target
 
     def _command(self, target: np.ndarray, kp: np.ndarray, kd: np.ndarray) -> None:
+        self._clear_gripper_assist()
+        self._gripper_position_control = True
         self.robot.command_joint_state({
             "pos": target, "vel": np.zeros(ACTION_DIM), "kp": kp, "kd": kd})
 
@@ -175,7 +184,68 @@ class YAMController:
         with self._lock:
             self._require_live()
             self.robot.enter_gravity_comp_idle()
+            self._gripper_position_control = False
+            self._assist_torque = 0.0
             self._mode, self._deadline = "passive", None
+
+    def configure_gripper_friction(self, parameters, *, enabled=True):
+        """Opt-in only; preserve arm dynamics and all position/replay gains."""
+        from hardware.yam_gripper_friction import GripperFriction
+        if not isinstance(parameters, GripperFriction):
+            raise TypeError('Expected validated GripperFriction parameters')
+        if (getattr(self.robot, '_gripper_index', None) != ARM_DOF
+                or not hasattr(self.robot, 'remapper')
+                or not hasattr(self.robot, '_command_lock')):
+            raise RuntimeError('Gripper assist requires the pinned i2rt linear-gripper interface')
+        with self._lock:
+            self._require_live()
+            self._clear_gripper_assist()
+            self._gripper_friction = parameters
+            self._gripper_assist_enabled = bool(enabled)
+            self._assist_deadline = self.clock() + self.command_timeout_s
+
+    def enter_gripper_tuning(self):
+        """Hold the measured arm pose; free only the gripper for manual tuning."""
+        with self._lock:
+            self._require_live()
+            target = self.read_state()[0]
+            kp, kd = self._base_kp.copy(), self._base_kd.copy()
+            kp[ARM_DOF] = kd[ARM_DOF] = 0.0
+            self._command(target, kp, kd)
+            self._gripper_position_control = False
+            self._mode, self._deadline = 'gripper_tuning', None
+
+    def _clear_gripper_assist(self):
+        if self._gripper_friction is not None:
+            with self.robot._command_lock:
+                self.robot._commands.torques[ARM_DOF] = 0.0
+        self._assist_torque = 0.0
+
+    def _update_gripper_assist(self):
+        """Called under controller lock by the existing 100 Hz watchdog thread."""
+        if self._gripper_friction is None:
+            return
+        if (not self._gripper_assist_enabled or self._gripper_position_control
+                or self._mode not in ('passive', 'gripper_tuning')
+                or self._assist_deadline is None or self.clock() >= self._assist_deadline):
+            self._clear_gripper_assist()
+            return
+        # Separate control feedback, never reused as a recorded observation.
+        # Do not renew the main-thread heartbeat from the assistance worker.
+        _check_health(self.robot, max_temperature_c=self.max_temperature_c)
+        q, dq, timestamp = _complete_state(self.robot)
+        if not np.isfinite(timestamp) or not 0 <= time.time() - timestamp <= 0.1:
+            raise RuntimeError('Gripper assist feedback is stale or has an invalid clock')
+        motor_velocity = float(self.robot.remapper.to_robot_joint_vel_space(dq)[ARM_DOF])
+        torque = self._gripper_friction.torque(float(q[ARM_DOF]), float(dq[ARM_DOF]), motor_velocity)
+        with self.robot._command_lock:
+            # The pinned public command_joint_state ignores a "torques" field.
+            # Use its existing command lock and touch ONLY J7 feedforward.
+            command = self.robot._commands
+            if command.kp[ARM_DOF] != 0:
+                torque = 0.0
+            command.torques[ARM_DOF] = torque
+        self._assist_torque = torque
 
     def command_passive_gripper(self, opening: float) -> None:
         """Position the gripper while leaving all six arm joints hand-guided.
@@ -245,6 +315,12 @@ class YAMController:
     def _watch(self) -> None:
         while not self._stop.wait(0.01):
             with self._lock:
+                try:
+                    self._update_gripper_assist()
+                except Exception as exc:
+                    self._gripper_assist_enabled = False
+                    self._fault = exc
+                    self._clear_gripper_assist()
                 if self._mode == "replay" and self._deadline is not None and self.clock() >= self._deadline:
                     try:
                         self.enter_safe_stop()
@@ -259,7 +335,11 @@ class YAMController:
         self._stop.set()
         if threading.current_thread() is not self._watchdog:
             self._watchdog.join(timeout=1.0)
-        self.robot.close()
+        try:
+            with self._lock:
+                self._clear_gripper_assist()
+        finally:
+            self.robot.close()
 
 
 def create_yam_controllers(interfaces: dict[str, str], *, i2rt_root=None,
@@ -462,7 +542,12 @@ class YAMBackend:
         self.hold_after_recording()
 
     def read_state(self):
-        states = [controller.read_state() for controller in self.controllers]
+        states = []
+        for controller in self.controllers:
+            # Surface an assistance/watchdog fault without taking a second SDK snapshot.
+            if isinstance(controller, YAMController):
+                controller._require_live()
+            states.append(controller.read_state())
         return (np.concatenate([state[0] for state in states]).astype(np.float32),
                 np.concatenate([state[1] for state in states]).astype(np.float32))
 

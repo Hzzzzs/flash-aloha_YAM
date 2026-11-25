@@ -189,9 +189,17 @@ def main():
     parser.add_argument('--pick-place', action='store_true',
                         help='Hand-guide arms; a/s close/open LEFT, k/l close/open RIGHT during recording')
     parser.add_argument('--duration', type=int, default=10, choices=range(5, 61), metavar='5..60')
+    parser.add_argument('--gripper-friction-config', type=Path,
+                        help='Opt-in YAM manual gripper assistance; tune each arm first')
     args = parser.parse_args()
     if args.camera_only and args.pick_place:
         parser.error('--pick-place requires the robot; cannot combine with --camera-only')
+    if args.gripper_friction_config and (args.camera_only or args.pick_place):
+        parser.error('--gripper-friction-config requires manual robot teaching, not camera-only/--pick-place')
+    friction = {}
+    if args.gripper_friction_config:
+        from hardware.yam_gripper_friction import load_config
+        friction = load_config(args.gripper_friction_config)
     # Import storage/transport before touching cameras or motors.
     from recording.distributed_recording import DistributedRecorder, EpisodeRequest, publish_recording
     from camera_utils.capture import acquire_camera_readers
@@ -242,6 +250,8 @@ def main():
                             NAMES, 'yam', False, True, can_interface_left='can_left',
                             can_interface_right='can_right', fps=FPS, robot_contract=ROBOT_CONTRACT)
                         backend = YAMBackend(ctx)
+                        for role, parameters in friction.items():
+                            backend._by_role[role].configure_gripper_friction(parameters)
                         backend.setup_for_recording()
                         backend.enable_passive_compensation()
                         print('Guide both arms to a comfortable pose. Press 1 to record, q to exit.', flush=True)
@@ -260,6 +270,10 @@ def main():
                         camera_mode=[WIDTH, HEIGHT, FPS], camera_names=NAMES)
                     if backend:
                         metadata['robot_contract'] = ROBOT_CONTRACT
+                        metadata['manual_gripper_friction'] = dict(
+                            algorithm='velocity_tanh_deadband_v1', torque_units='Nm',
+                            velocity_units='SDK_motor_coordinate_rad_s',
+                            arms={role: asdict(parameters) for role, parameters in friction.items()})
                     recorder.start_episode(EpisodeRequest(
                         session_id=tag, data_dir=str(dataset / 'data'), camera_names=NAMES,
                         record_rollout=not args.camera_only, record_dagger=False,

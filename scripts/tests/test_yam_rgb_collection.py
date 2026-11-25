@@ -26,6 +26,15 @@ def test_camera_paths_can_be_mapped_without_changing_capture(monkeypatch):
     assert (mapped.FPS, mapped.WIDTH, mapped.HEIGHT) == (30., 640, 480)
 
 
+@pytest.mark.parametrize('mode', ['--camera-only', '--pick-place'])
+def test_friction_assist_rejects_nonmanual_modes_before_loading_config(monkeypatch, mode):
+    monkeypatch.setattr('sys.argv', ['record_yam.py', mode,
+                                    '--gripper-friction-config', '/does-not-exist.json'])
+    with pytest.raises(SystemExit) as result:
+        collector.main()
+    assert result.value.code == 2
+
+
 def test_pick_place_keys_do_not_change_default_manual_teaching():
     commands = []
     backend = SimpleNamespace(command_teaching_gripper=lambda *args: commands.append(args))
