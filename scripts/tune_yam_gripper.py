@@ -43,12 +43,25 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--arm', choices=['left', 'right'], required=True)
     parser.add_argument('--config', type=Path, default=ROOT / 'config/yam-gripper-friction.json')
+    parser.add_argument('--max-assist-torque', type=float, help='Explicit total assist cap in Nm, up to ARX reference 1.5')
+    parser.add_argument('--breakaway-test', action='store_true',
+                        help='Start with zero motion assistance; enable b/v 150ms opening/closing test pulses')
     args = parser.parse_args()
     parameters = (load_config(args.config).get(args.arm, GripperFriction())
-                  if args.config.exists() else GripperFriction())
+                  if args.config.exists() and not args.breakaway_test else GripperFriction())
+    if args.max_assist_torque is not None:
+        try:
+            parameters = replace(parameters, max_torque_nm=args.max_assist_torque)
+        except ValueError as exc:
+            parser.error(str(exc))
+    pulse_magnitude = min(.03, parameters.max_torque_nm)
     print(f'Only {args.arm} arm (can_{args.arm}) will connect. Stop other CAN controllers first.')
     print('Support the arm; clear the gripper for startup calibration. Then arm joints HOLD the current pose.')
-    print('Manual gripper only. Assistance starts OFF. q closes motors in place: support the arm BEFORE q.')
+    print('Assistance starts OFF. q closes motors in place: support the arm BEFORE q.')
+    print(f'Total assist cap: {parameters.max_torque_nm:.3f} Nm (a limit, not a requested torque).')
+    if args.breakaway_test:
+        print('Breakaway test: b=OPEN pulse, v=CLOSE pulse; n/m=pulse +/-0.005 Nm; duration 0.15 s.')
+        print('Pulses actively move the gripper even at rest. Keep fingers outside jaws; use external handle only.')
     if input('Type YAM_GRIPPER_READY to connect: ').strip() != 'YAM_GRIPPER_READY':
         return
     controllers = {}
@@ -78,6 +91,19 @@ def main():
                     changed = False
                     if key == '1':
                         enabled, changed = not enabled, True
+                    elif args.breakaway_test and key in ('b', 'v'):
+                        if enabled:
+                            accepted = controller.request_gripper_pulse(1 if key == 'b' else -1, pulse_magnitude)
+                            log.write(json.dumps(dict(time=time.time(), event='pulse', direction=key,
+                                                      magnitude_nm=pulse_magnitude, accepted=accepted)) + '\n')
+                            log.flush()
+                        else:
+                            print('Master OFF: press 1 before requesting a pulse.')
+                    elif args.breakaway_test and key in ('n', 'm'):
+                        pulse_magnitude = round(max(.005, min(parameters.max_torque_nm,
+                            pulse_magnitude + (.005 if key == 'n' else -.005))), 6)
+                        pulse_magnitude = min(pulse_magnitude, parameters.max_torque_nm)
+                        print(f'Pulse magnitude: {pulse_magnitude:.3f} Nm; no pulse sent.')
                     elif key == 's':
                         save_config(args.config, args.arm, parameters)
                         print(f'Saved {args.arm} parameters to {args.config}. Collection requires explicit --gripper-friction-config.')
@@ -88,8 +114,10 @@ def main():
                     if changed:
                         controller.configure_gripper_friction(parameters, enabled=enabled)
                     if changed or time.monotonic() >= next_status:
-                        # Only settings/events, not a new observation/trajectory recorder.
-                        event = dict(time=time.time(), arm=args.arm, enabled=enabled, parameters=asdict(parameters))
+                        # Aggregate diagnostics, not a new observation/trajectory recorder.
+                        stats = controller.gripper_assist_diagnostics()
+                        event = dict(time=time.time(), arm=args.arm, enabled=enabled, parameters=asdict(parameters),
+                                     pulse_magnitude_nm=pulse_magnitude, diagnostics=stats)
                         log.write(json.dumps(event) + '\n')
                         log.flush()
                         print(f'{"ON" if enabled else "OFF"} Fc={parameters.coulomb_nm:.3f} Nm '
@@ -97,7 +125,9 @@ def main():
                               f'v0={parameters.transition_rad_s:.2f} rad/s '
                               f'accel={"ON" if parameters.acceleration_enabled else "OFF"} '
                               f'Ka={parameters.acceleration_gain_nm_s2_rad:.4f} Nm*s^2/rad '
-                              f'assist={controller._assist_torque:+.4f} Nm (command, not measured force)')
+                              f'assist={controller._assist_torque:+.4f} Nm '
+                              f'peak={stats["peak_command_nm"]:.4f} Nm '
+                              f'capped={stats["capped_ticks"]}/{stats["ticks"]} (command, not measured force)')
                         next_status = time.monotonic() + 1.
                     time.sleep(.02)
     finally:

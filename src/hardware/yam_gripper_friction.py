@@ -32,10 +32,10 @@ class GripperFriction:
                 continue
             if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value):
                 raise ValueError(f'{field.name} must be a finite number')
-        if not (0 <= self.coulomb_nm <= 0.06 and 0 <= self.viscous_nm_s_rad <= 0.02
+        if not (0 <= self.coulomb_nm <= 1.5 and 0 <= self.viscous_nm_s_rad <= 0.02
                 and 0.02 <= self.transition_rad_s <= 2.0
                 and 0.005 <= self.deadband_rad_s <= 0.2
-                and 0 < self.max_torque_nm <= 0.06
+                and 0 < self.max_torque_nm <= 1.5
                 and 0.1 <= self.max_speed_rad_s <= 8.0
                 and 0.02 <= self.end_margin <= 0.2
                 and 0 <= self.acceleration_gain_nm_s2_rad <= 0.002
@@ -43,9 +43,15 @@ class GripperFriction:
                 and 0.02 <= self.acceleration_filter_s <= 0.2):
             raise ValueError('Gripper friction parameter outside supported tuning limits')
 
-    def torque(self, opening, normalized_velocity, motor_velocity, acceleration=0.0):
-        if not all(math.isfinite(v) for v in (opening, normalized_velocity, motor_velocity, acceleration)):
+    def torque(self, opening, normalized_velocity, motor_velocity, acceleration=0.0,
+               *, pulse_nm=0.0, motor_opening_sign=1.0, diagnostics=None):
+        if not all(math.isfinite(v) for v in (opening, normalized_velocity, motor_velocity, acceleration,
+                                               pulse_nm, motor_opening_sign)):
             raise ValueError('Non-finite gripper feedback')
+        if motor_opening_sign not in (-1., 1.):
+            raise ValueError('Expected calibrated opening direction')
+        if diagnostics is not None:
+            diagnostics.update(raw_nm=0., capped=False)
         if not 0 <= opening <= 1:
             return 0.0
         if abs(motor_velocity) > self.max_speed_rad_s:
@@ -59,9 +65,13 @@ class GripperFriction:
         if self.acceleration_enabled and speed > 0 and acceleration * velocity > 0:
             accel = math.copysign(max(0., abs(acceleration) - self.acceleration_deadband_rad_s2), acceleration)
             torque += self.acceleration_gain_nm_s2_rad * accel
+        torque += pulse_nm
+        if diagnostics is not None:
+            diagnostics.update(raw_nm=torque, capped=abs(torque) > self.max_torque_nm)
         torque = max(-self.max_torque_nm, min(self.max_torque_nm, torque))
         # Taper only toward the approached stop; still allow retreat from it.
-        distance = 1 - opening if normalized_velocity > 0 else opening
+        direction = torque * motor_opening_sign if pulse_nm else normalized_velocity
+        distance = 1 - opening if direction > 0 else opening
         return torque * min(1.0, max(0.0, distance / self.end_margin))
 
 

@@ -45,7 +45,7 @@ CAMERA_MAX_AGE_MS=150 CAMERA_MAX_SKEW_MS=100 bash scripts/collect_yam.sh --durat
 
 ```bash
 bash scripts/setup_yam.sh
-bash scripts/check_yam.sh  # 无硬件检查；126项测试及4个subtests
+bash scripts/check_yam.sh  # 无硬件检查；141项测试及4个subtests
 
 cp config/yam-local.env.example config/yam-local.env
 # 编辑左右相机彩色节点；按指南建立can_left/can_right的设备映射。

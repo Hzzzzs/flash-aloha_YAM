@@ -120,6 +120,10 @@ class YAMController:
         self._assist_deadline = None
         self._assist_torque = 0.0
         self._assist_acceleration = AccelerationEstimator()
+        self._assist_pulse = None
+        self._pulse_rearm_at = 0.0
+        self._assist_stats = dict(ticks=0, peak_motor_speed_rad_s=0., peak_acceleration_rad_s2=0.,
+                                  peak_raw_nm=0., peak_command_nm=0., capped_ticks=0)
         self._base_kp = np.asarray(robot._kp, dtype=float).copy()
         self._base_kd = np.asarray(robot._kd, dtype=float).copy()
         self._passive_kd = np.asarray(robot._grav_comp_kd, dtype=float).copy()
@@ -219,11 +223,37 @@ class YAMController:
             self._mode, self._deadline = 'gripper_tuning', None
 
     def _clear_gripper_assist(self):
+        self._assist_pulse = None
         self._assist_acceleration.reset()
         if self._gripper_friction is not None:
             with self.robot._command_lock:
                 self.robot._commands.torques[ARM_DOF] = 0.0
         self._assist_torque = 0.0
+
+    def request_gripper_pulse(self, opening_direction, magnitude_nm):
+        """Operator-triggered 150ms pulse; diagnostic tuning only, never recording."""
+        with self._lock:
+            self._require_live()
+            if (self._mode != 'gripper_tuning' or self._gripper_position_control
+                    or not self._gripper_assist_enabled):
+                raise RuntimeError('Pulse requires gripper tuning with master assistance ON')
+            if (opening_direction not in (-1, 1) or not np.isfinite(magnitude_nm)
+                    or not 0 < magnitude_nm <= self._gripper_friction.max_torque_nm):
+                raise ValueError('Invalid pulse direction or magnitude')
+            now = self.clock()
+            if now < self._pulse_rearm_at:
+                return False
+            self._assist_pulse = (opening_direction, magnitude_nm, now + .15)
+            self._pulse_rearm_at = now + .5
+            return True
+
+    def gripper_assist_diagnostics(self):
+        """Drain aggregate control statistics; no separate observation/trajectory stream."""
+        with self._lock:
+            result = dict(self._assist_stats)
+            for key in self._assist_stats:
+                self._assist_stats[key] = 0
+            return result
 
     def _update_gripper_assist(self):
         """Called under controller lock by the existing 100 Hz watchdog thread."""
@@ -245,16 +275,37 @@ class YAMController:
         acceleration = (self._assist_acceleration.update(
             motor_velocity, timestamp, parameters.acceleration_filter_s)
             if parameters.acceleration_enabled else 0.0)
-        torque = parameters.torque(float(q[ARM_DOF]), float(dq[ARM_DOF]), motor_velocity, acceleration)
+        opening_span = float(self.robot.remapper.to_robot_joint_vel_space(np.r_[np.zeros(6), 1.])[ARM_DOF])
+        if not np.isfinite(opening_span) or opening_span == 0:
+            raise RuntimeError('Invalid calibrated gripper direction')
+        opening_sign = float(np.sign(opening_span))
+        pulse_nm = 0.
+        if self._assist_pulse is not None:
+            direction, magnitude, until = self._assist_pulse
+            if self.clock() < until:
+                pulse_nm = direction * opening_sign * magnitude
+            else:
+                self._assist_pulse = None
+        diagnostic = {}
+        torque = parameters.torque(float(q[ARM_DOF]), float(dq[ARM_DOF]), motor_velocity, acceleration,
+                                  pulse_nm=pulse_nm, motor_opening_sign=opening_sign, diagnostics=diagnostic)
         with self.robot._command_lock:
             # The pinned public command_joint_state ignores a "torques" field.
             # Use its existing command lock and touch ONLY J7 feedforward.
             command = self.robot._commands
             if command.kp[ARM_DOF] != 0:
                 torque = 0.0
+                self._assist_pulse = None
                 self._assist_acceleration.reset()
             command.torques[ARM_DOF] = torque
         self._assist_torque = torque
+        stats = self._assist_stats
+        stats['ticks'] += 1
+        stats['capped_ticks'] += int(diagnostic['capped'])
+        for key, value in (('peak_motor_speed_rad_s', motor_velocity),
+                           ('peak_acceleration_rad_s2', acceleration),
+                           ('peak_raw_nm', diagnostic['raw_nm']), ('peak_command_nm', torque)):
+            stats[key] = max(stats[key], abs(value))
 
     def command_passive_gripper(self, opening: float) -> None:
         """Position the gripper while leaving all six arm joints hand-guided.

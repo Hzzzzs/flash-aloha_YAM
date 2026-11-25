@@ -84,7 +84,7 @@ def test_stationary_deadband_saturation_and_end_taper():
 
 
 @pytest.mark.parametrize('values', [dict(coulomb_nm=float('nan')), dict(coulomb_nm=-.01),
-    dict(max_torque_nm=.061), dict(transition_rad_s=0), dict(viscous_nm_s_rad=-.001),
+    dict(max_torque_nm=1.501), dict(transition_rad_s=0), dict(viscous_nm_s_rad=-.001),
     dict(deadband_rad_s=True), dict(end_margin=0), dict(max_speed_rad_s=100)])
 def test_invalid_parameters_rejected(values):
     with pytest.raises(ValueError):
@@ -269,3 +269,88 @@ def test_tuner_acceleration_toggle_and_gain_steps():
     assert adjust(p, 'j').acceleration_gain_nm_s2_rad == 0
     assert not adjust(p, 'a').acceleration_enabled
     assert adjust(replace(p, acceleration_gain_nm_s2_rad=.002), 'u').acceleration_gain_nm_s2_rad == .002
+
+
+def test_arx_reference_cap_is_opt_in_and_does_not_set_output():
+    p = GripperFriction(max_torque_nm=1.5)
+    assert GripperFriction().max_torque_nm == .03
+    assert p.torque(.5, 0., 0.) == 0
+    assert p.torque(.5, 0., 0., pulse_nm=.03) == .03
+    assert p.torque(.5, .1, 1., pulse_nm=2.) == 1.5
+    assert p.torque(.5, -.1, -1., pulse_nm=-2.) == -1.5
+
+
+@pytest.mark.parametrize('span', [6.57, -6.57])
+@pytest.mark.parametrize('direction', [1, -1])
+def test_zero_speed_pulse_direction_timeout_and_diagnostics(make_controller, span, direction):
+    c, r, clock = make_controller(span)
+    c.configure_gripper_friction(GripperFriction(max_torque_nm=1.5))
+    c.enter_gripper_tuning()
+    r._joint_state.vel[:] = 0.
+    r._commands.torques[:6] = np.arange(6)
+    assert c.request_gripper_pulse(direction, .03)
+    assert not c.request_gripper_pulse(-direction, .03)  # Cannot prolong active pulse.
+    c._update_gripper_assist()
+    assert r._commands.torques[6] == pytest.approx(direction * np.sign(span) * .03)
+    np.testing.assert_array_equal(r._commands.torques[:6], np.arange(6))
+    np.testing.assert_array_equal(r._commands.kp[:6], r._kp[:6])
+    stats = c.gripper_assist_diagnostics()
+    assert stats['ticks'] == 1 and stats['peak_command_nm'] == .03
+    assert c.gripper_assist_diagnostics()['ticks'] == 0
+    clock[0] += .151
+    c._update_gripper_assist()
+    assert r._commands.torques[6] == 0
+    assert not c.request_gripper_pulse(direction, .03)  # Brief rearm delay.
+    clock[0] += .35
+    c.check()
+    assert c.request_gripper_pulse(direction, .03)
+
+
+@pytest.mark.parametrize('span', [6.57, -6.57])
+def test_stationary_pulse_tapers_toward_commanded_endpoint(make_controller, span):
+    c, r, clock = make_controller(span)
+    c.configure_gripper_friction(GripperFriction())
+    c.enter_gripper_tuning()
+    r._joint_state.vel[:] = 0.
+    r._joint_state.pos[6] = 1.
+    c.request_gripper_pulse(1, .03)
+    c._update_gripper_assist()
+    assert r._commands.torques[6] == 0
+    clock[0] += .51
+    c.check()
+    c.request_gripper_pulse(-1, .03)
+    c._update_gripper_assist()
+    assert r._commands.torques[6] == pytest.approx(-np.sign(span) * .03)
+
+
+@pytest.mark.parametrize('exit_kind', ['off', 'hold', 'passive', 'safe_stop', 'close', 'heartbeat', 'fault'])
+def test_pulse_cancellation_and_tuning_only(make_controller, exit_kind):
+    c, r, clock = make_controller()
+    with pytest.raises(RuntimeError): c.request_gripper_pulse(1, .03)
+    c.enter_gripper_tuning()
+    c.request_gripper_pulse(1, .03)
+    c._update_gripper_assist()
+    if exit_kind == 'off': c.configure_gripper_friction(c._gripper_friction, enabled=False)
+    elif exit_kind == 'hold': c.hold_current()
+    elif exit_kind == 'passive': c.enter_passive()
+    elif exit_kind == 'safe_stop': c.enter_safe_stop()
+    elif exit_kind == 'close': c.close()
+    elif exit_kind == 'heartbeat':
+        clock[0] += .6
+        c._update_gripper_assist()
+    else:
+        r._joint_state.timestamp -= 1
+        c._stop.wait = Mock(side_effect=[False, True])
+        c._watch()
+    assert c._assist_pulse is None
+    assert r._commands.torques[6] == 0
+
+
+def test_saturation_diagnostics_reports_unclipped_request(make_controller):
+    c, r, _ = make_controller()
+    c.configure_gripper_friction(GripperFriction(coulomb_nm=.1))
+    c._update_gripper_assist()
+    stats = c.gripper_assist_diagnostics()
+    assert stats['peak_raw_nm'] > .03
+    assert stats['peak_command_nm'] == .03
+    assert stats['capped_ticks'] == 1
