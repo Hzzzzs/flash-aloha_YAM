@@ -124,6 +124,40 @@ def test_image_preprocessing_does_not_resnapshot(monkeypatch):
                                   np.r_[np.arange(7), -np.arange(7)])
 
 
+def test_batched_control_write_preserves_every_selected_row(tmp_path):
+    writer = ControlWriter(tmp_path / 'batch.zarr')
+    samples = []
+    for index in range(11):
+        sample = observation(stamp=100. + index / 30, frame=7 + index).recording_fields()
+        sample['qpos'] = sample['qpos'] + index
+        sample['commanded_action'] = sample['qpos'].copy()
+        samples.append(sample)
+    writer.append_many(samples[:8])
+    writer.append_many(samples[8:])
+    # Reopen storage: the committed count must correspond to actual disk rows.
+    import zarr
+    saved = zarr.open_group(str(tmp_path / 'batch.zarr'), mode='r')
+    assert writer.count == 11
+    np.testing.assert_array_equal(saved['qpos'][:], [s['qpos'] for s in samples])
+    np.testing.assert_array_equal(saved['commanded_action'][:], [s['commanded_action'] for s in samples])
+    np.testing.assert_array_equal(saved['timestamps'][:], [s['timestamp'] for s in samples])
+    for field in ('frame_number', 'capture_timestamp', 'consumer_received_timestamp'):
+        np.testing.assert_array_equal(saved[f'camera_observation/video_left/{field}'][:],
+            [s['camera_observation']['cameras']['video_left'][field] for s in samples])
+
+
+def test_bad_pairing_inside_batch_does_not_commit_rows(tmp_path):
+    writer = ControlWriter(tmp_path / 'bad.zarr')
+    good = observation().recording_fields()
+    good['commanded_action'] = good['qpos'].copy()
+    bad = copy.deepcopy(good)
+    bad['camera_observation']['cameras']['video_left']['capture_timestamp'] = 99.
+    with pytest.raises(CameraTimingError, match='age'):
+        writer.append_many([good, bad])
+    assert writer.count == 0
+    assert 'timestamps' not in writer.group
+
+
 @pytest.mark.parametrize('path,required', [
     ('src/recording/record_episode_single.py', 'standard_capture.capture_observation'),
     ('src/inference/inference_remote.py', 'standard_capture.capture_observation'),

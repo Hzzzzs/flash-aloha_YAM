@@ -1,0 +1,5 @@
+# Add to the already working i2rt environment; training dependencies are separate.
+robotmq==0.1.15
+robologger==0.1.7
+zarr==2.18.7
+av==18.1.1

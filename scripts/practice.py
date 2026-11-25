@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live gravity-compensated manual practice for ARX arms.
+"""Live gravity-compensated manual practice for ARX or YAM arms.
 
     uv run scripts/practice.py --arm both
     uv run scripts/practice.py --arm right
@@ -89,7 +89,10 @@ def close_controllers(controllers):
 
 def selected_interfaces(args):
     roles = ('left', 'right') if args.arm == 'both' else (args.arm,)
-    interfaces = {'left': args.left_can_interface, 'right': args.right_can_interface}
+    defaults = ({'left': 'can_left', 'right': 'can_right'} if args.robot == 'yam'
+                else {'left': 'can0', 'right': 'can1'})
+    interfaces = {'left': args.left_can_interface or defaults['left'],
+                  'right': args.right_can_interface or defaults['right']}
     if args.can_interface:
         ports = [port.strip() for port in args.can_interface.split(',')]
         if len(ports) != len(roles) or not all(ports):
@@ -105,12 +108,17 @@ def selected_interfaces(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--robot', choices=('arx',), default='arx', help='Backend (ARX)')
+    parser.add_argument('--robot', choices=('arx', 'yam'), default='arx', help='Backend (default: ARX)')
     parser.add_argument('--arm', choices=('left', 'right', 'both'), default='left', help='Arm selection (default: left)')
     parser.add_argument('--can-interface', help='Optional override: can0 for one arm or can0,can1 for both')
-    parser.add_argument('--left-can-interface', default='can0')
-    parser.add_argument('--right-can-interface', default='can1')
+    parser.add_argument('--left-can-interface', default=None,
+                        help='Default: ARX can0; YAM can_left')
+    parser.add_argument('--right-can-interface', default=None,
+                        help='Default: ARX can1; YAM can_right')
     parser.add_argument('--arx-model', choices=('L5', 'Trossen_L5'), default='L5')
+    parser.add_argument('--i2rt-root', default=None, help='i2rt checkout (default: $I2RT_ROOT or sibling ../i2rt)')
+    parser.add_argument('--gripper-force-n', type=float, default=5.0,
+                        help='YAM gripper force limit in newtons (default: 5)')
     parser.add_argument('--controller-fps', type=float, default=200.0, help='Python update rate (default: 200)')
     parser.add_argument('--duration', type=float, default=0.0, help='Seconds; 0 runs until Ctrl+C')
     return parser
@@ -122,6 +130,9 @@ def run(args):
         raise ValueError(f'--controller-fps must be finite and in (0, {limit}]')
     if not math.isfinite(args.duration) or args.duration < 0:
         raise ValueError('--duration must be finite and nonnegative')
+    if args.robot == 'yam' and (not math.isfinite(args.gripper_force_n)
+                                or not 0 < args.gripper_force_n <= 25):
+        raise ValueError('--gripper-force-n must be finite and in (0, 25]')
     interfaces = selected_interfaces(args)
     controllers = {}
     result = 0
@@ -129,24 +140,44 @@ def run(args):
         def damping_target():
             if not controllers:
                 return None
+            if args.robot == 'yam':
+                from hardware.backends.yam import YAMDamping
+                return YAMDamping(list(controllers.values()))
             return ARXDamping([controller.controller for controller in controllers.values()])
 
+        if args.robot == 'yam':
+            from recording.practice_support import TerminalKeyWatcher
+            key_context = TerminalKeyWatcher()
+        else:
+            from contextlib import nullcontext
+            key_context = nullcontext(None)
         try:
-            # Ctrl+C or any failure: damping until 'h', then home, then disable.
-            with damping_exit(damping_target):
-                print('Support the arms during startup and shutdown.', flush=True)
-                controllers.update(build_arx_controllers(interfaces, args.arx_model))
-                for controller in controllers.values():
-                    controller.practice_step()
-                print('Gravity compensation active: ' + ', '.join(
-                    f'{role}={port}' for role, port in interfaces.items())
-                    + ". Ctrl+C: damping, then 'h' returns home.", flush=True)
-                started = time.monotonic()
-                while not args.duration or time.monotonic() - started < args.duration:
-                    tick = time.monotonic()
+            with key_context as keys:
+                options = {} if keys is None else {'home_requested': keys.home_requested}
+                # Ctrl+C or any failure: damping until 'h', then home, then disable.
+                with damping_exit(damping_target, **options):
+                    print('Support the arms during startup and shutdown.', flush=True)
+                    if args.robot == 'yam':
+                        from hardware.backends.yam import create_yam_controllers
+                        controllers.update(create_yam_controllers(
+                            interfaces, i2rt_root=args.i2rt_root,
+                            gripper_force_n=args.gripper_force_n))
+                    else:
+                        controllers.update(build_arx_controllers(interfaces, args.arx_model))
+                    if args.robot == 'yam':
+                        for controller in controllers.values():
+                            controller.enter_passive()
                     for controller in controllers.values():
                         controller.practice_step()
-                    time.sleep(max(0.0, 1.0 / args.controller_fps - (time.monotonic() - tick)))
+                    print(f'{args.robot.upper()} gravity compensation active: ' + ', '.join(
+                        f'{role}={port}' for role, port in interfaces.items())
+                        + ". Ctrl+C: damping, then 'h' returns home.", flush=True)
+                    started = time.monotonic()
+                    while not args.duration or time.monotonic() - started < args.duration:
+                        tick = time.monotonic()
+                        for controller in controllers.values():
+                            controller.practice_step()
+                        time.sleep(max(0.0, 1.0 / args.controller_fps - (time.monotonic() - tick)))
         except KeyboardInterrupt:
             print('\nStopping practice...', flush=True)
         except Exception as exc:

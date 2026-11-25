@@ -360,7 +360,18 @@ class RobotMQCameraCache:
             references = {name: {key: packets[name][key] for key in (
                 'frame_number', 'capture_timestamp', 'consumer_received_timestamp')} for name in names}
             if validate:
-                require_camera_timestamps({name: ref['capture_timestamp'] for name, ref in references.items()}, now=cutoff)
+                try:
+                    require_camera_timestamps({name: ref['capture_timestamp'] for name, ref in references.items()}, now=cutoff)
+                except CameraTimingError as exc:
+                    # Diagnose the failed snapshot itself; never reread or replace
+                    # the selected frames to make a stale observation pass.
+                    detail = {name: dict(
+                        frame_number=ref['frame_number'],
+                        capture_timestamp=ref['capture_timestamp'],
+                        capture_to_consumer_ms=1000 * (ref['consumer_received_timestamp'] - ref['capture_timestamp']),
+                        consumer_to_snapshot_ms=1000 * (cutoff - ref['consumer_received_timestamp']))
+                        for name, ref in references.items()}
+                    raise CameraTimingError(f'{exc}; snapshot_timing={json.dumps(detail)}') from exc
             observation = dict(snapshot_timestamp=cutoff, cameras=references)
             images = {name: self.rings[name].copy(packets[name]) for name in names} if copy_images else {}
             return images, observation
