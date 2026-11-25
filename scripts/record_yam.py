@@ -34,7 +34,8 @@ from recording.recording_utils import atomic_write_json, summarize_recording_rat
 NAMES = ['video_left', 'video_right']
 FPS = 30.0
 WIDTH, HEIGHT = 640, 480
-DEVICES = {role: f'/dev/v4l/by-path/pci-0000:00:14.0-usb-0:{port}:1.0-video-index4'
+DEVICES = {role: os.environ.get(f'YAM_CAMERA_{role.upper()}',
+                               f'/dev/v4l/by-path/pci-0000:00:14.0-usb-0:{port}:1.0-video-index4')
            for role, port in [('left', '5.3'), ('right', '5.4')]}
 GRIPPER_KEYS = {'a': ('left', 0.), 's': ('left', 1.),
                 'k': ('right', 0.), 'l': ('right', 1.)}

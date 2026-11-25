@@ -14,6 +14,8 @@
 
 | 文件 | Review内容 |
 | --- | --- |
+| `scripts/setup_yam.sh`、`scripts/check_yam.sh` | 固定SDK提交、退出补丁、完整Python依赖及无硬件检查 |
+| `scripts/08_*`、`scripts/10_*`、`scripts/13_*` | 原重力补偿测试迁入；Python控制逻辑不变，启动器适配仓库路径 |
 | `scripts/collect_yam.sh` | 仓库内启动器、Python/SDK位置和显式时序配置 |
 | `scripts/record_yam.py` | 相机启动、标准观测、录制/保存/回放状态流程，默认手动夹爪 |
 | `src/hardware/backends/yam.py` | SDK适配、同一状态对象读取qpos/qvel、夹爪归一化、命令看门狗、回放与退出 |
@@ -59,7 +61,7 @@ flowchart LR
 
 1. YAM SDK快照路径访问 `_state_lock`/`_joint_state`，需关注SDK升级兼容性；
    已验证安装版本i2rt 1.1.2，其他版本不能未经验证直接等同。
-2. 相机DEVICES仍是本机by-path，CAN左右名由现场规则建立；迁移需人工确认身份。
+2. 相机通过YAM_CAMERA_LEFT/RIGHT覆盖，CAN左右名由现场规则建立；迁移需人工确认身份。
 3. libx264低CPU选项作用于共享相机服务器的libx264路径；NVENC路径不采用这组选项。
    依赖需应用仓库补丁，重装robologger后需重施。ultrafast同码率画质尚未验收。
 4. 临时150/100ms限值通过环境变量明确传入并写入元数据；默认仍80/50ms。
@@ -69,24 +71,18 @@ flowchart LR
 
 ## 验证
 
-提交前核心无硬件测试：76项通过；启动器语法、帮助入口和补丁重复应用检查通过。
+初版核心无硬件测试76项通过；补齐复现后，独立环境85项及4个subtests通过，含重力诊断和退出测试。
+固定SDK、依赖安装、模型FK和FFmpeg检查见[安装指南](yam_quickstart.md)。
+[独立目录复现记录](validation/2026-11-25-reproduction.md)说明实际运行范围及硬件验收边界。
 
 实机证据：双相机60秒1800条通过，随后双臂任务1109条录制/保存/回放通过；
 原生发布Episode的状态、动作和首中末图像读取通过。测试不等于完整训练链路验收。
 
-从仓库根目录运行核心无硬件测试（环境需pytest）：
+从仓库根目录运行：
 
 ```bash
-PYTHONPATH=src ../i2rt/.venv/bin/python -m pytest -q \
-  scripts/tests/test_yam_backend.py \
-  scripts/tests/test_yam_rgb_collection.py \
-  scripts/tests/test_yam_replay_analysis.py \
-  scripts/tests/test_standard_capture.py \
-  scripts/tests/test_distributed_recording.py
-
-bash -n scripts/collect_yam.sh
-bash scripts/collect_yam.sh --help
-../i2rt/.venv/bin/python scripts/apply_yam_robologger_patch.py
+bash scripts/setup_yam.sh  # 首次安装，不操作设备
+bash scripts/check_yam.sh  # 依赖、SDK/编码补丁、模型及核心模拟测试
 ```
 
 这些测试使用模拟状态/硬件，不启动机械臂或真实相机。真实数采/回放由操作员按教程执行。

@@ -16,6 +16,16 @@ collector = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(collector)
 
 
+def test_camera_paths_can_be_mapped_without_changing_capture(monkeypatch):
+    monkeypatch.setenv('YAM_CAMERA_LEFT', '/dev/v4l/by-id/left-color')
+    monkeypatch.setenv('YAM_CAMERA_RIGHT', '/dev/v4l/by-id/right-color')
+    mapped = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mapped)
+    assert mapped.DEVICES == {'left': '/dev/v4l/by-id/left-color',
+                              'right': '/dev/v4l/by-id/right-color'}
+    assert (mapped.FPS, mapped.WIDTH, mapped.HEIGHT) == (30., 640, 480)
+
+
 def test_pick_place_keys_do_not_change_default_manual_teaching():
     commands = []
     backend = SimpleNamespace(command_teaching_gripper=lambda *args: commands.append(args))

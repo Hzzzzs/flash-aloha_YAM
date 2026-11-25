@@ -1,11 +1,17 @@
 # YAM Ultra 2: camera-free practice and replay
 
 For the current camera-backed collection workflow, start with [the YAM guide](yam_quickstart.md).
-From this repository root, after installing i2rt, the operator-run entry points are:
+From this repository root, after completing `bash scripts/setup_yam.sh`, select the environment first:
 
 ```bash
-PYTHONPATH=src:../i2rt ../i2rt/.venv/bin/python scripts/practice.py --robot yam --arm both --duration 10
-PYTHONPATH=src:../i2rt ../i2rt/.venv/bin/python src/recording/replay_practice.py --robot yam --arms both --fps 100
+source scripts/yam_env.sh
+```
+
+The operator-run entry points are:
+
+```bash
+"$PYTHON_BIN" scripts/practice.py --robot yam --arm both --duration 10
+"$PYTHON_BIN" src/recording/replay_practice.py --robot yam --arms both --fps 100
 ```
 
 Both initialize real controllers and calibrate grippers. Read the startup/exit instructions below first.
@@ -14,15 +20,15 @@ This integration keeps Flash ALOHA's practice/replay state machine and action
 layout: each arm is `[q1..q6, gripper]`, in left-then-right order for two arms.
 The gripper coordinate is normalized (`0` closed, `1` open).
 
-The expected local layout is:
+The default installed layout is:
 
 ```text
-YAM驱动数采验证/
-├── flash-aloha_YAM/
-└── i2rt/
+flash-aloha_YAM/
+├── .venv-yam/
+└── .yam-deps/i2rt/
 ```
 
-The commands below use the already working i2rt virtual environment and do not
+The commands below use the selected YAM environment and do not
 load Flash's camera, dataset, training, or policy dependencies.
 
 ## 1. Ten-second dual-arm practice check
@@ -32,7 +38,7 @@ startup. Both arms then become hand-guided under gravity compensation. At the
 end, the SDK closes and the arms become limp, so support them again.
 
 ```bash
-PYTHONPATH=src:../i2rt ../i2rt/.venv/bin/python scripts/practice.py --robot yam --arm both --duration 10
+"$PYTHON_BIN" scripts/practice.py --robot yam --arm both --duration 10
 ```
 
 For an open-ended session, omit `--duration`. Ctrl+C enters the safe-exit path:
@@ -44,7 +50,7 @@ press `h` to return both arms to their startup poses and close.
 Clear both workspaces and confirm that the repaired right camera mount and cable are secure.
 
 ```bash
-PYTHONPATH=src:../i2rt ../i2rt/.venv/bin/python src/recording/replay_practice.py --robot yam --arms both --fps 100
+"$PYTHON_BIN" src/recording/replay_practice.py --robot yam --arms both --fps 100
 ```
 
 Controls:

@@ -5,8 +5,10 @@
 训练与自主策略部署尚未验收。此处的回放执行已录制轨迹，不代表模型学会任务。
 
 - **从这里开始：[YAM 安装、录制与迁移指南](docs/yam_quickstart.md)**
+- [重力补偿测试与参数诊断](docs/yam_gravity_tests.md)
 - **代码 review：[改动范围、数据流程与验证方式](docs/yam_review.md)**
 - [2026-11-25 实机验证与回放误差](docs/validation/2026-11-25-yam.md)
+- [独立目录安装与无硬件复现结果](docs/validation/2026-11-25-reproduction.md)
 - [录制格式、时序与历史验证](docs/yam_rgb_collection.md)
 - [不带相机的 practice/replay](docs/yam_practice_replay.md)
 
@@ -22,7 +24,7 @@ CAMERA_MAX_AGE_MS=150 CAMERA_MAX_SKEW_MS=100 bash scripts/collect_yam.sh --durat
 ```
 
 启动、夹爪标定、回放起点移动与退出说明见上面的YAM指南。
-默认夹爪由手动示教控制；不加 `--pick-place`。硬件映射仍含本机端口，迁移时需重新确认。
+默认夹爪由手动示教控制；不加 `--pick-place`。硬件映射通过本机配置设置，迁移时需重新确认。
 
 ### 当前进度（2026-11-25）
 
@@ -37,15 +39,19 @@ CAMERA_MAX_AGE_MS=150 CAMERA_MAX_SKEW_MS=100 bash scripts/collect_yam.sh --durat
 
 ### YAM快速使用（操作员执行）
 
-先在相邻 `../i2rt/` 准备Python 3.11的SDK环境，系统安装FFmpeg、patch、CAN及V4L2工具。
-完整步骤见[YAM指南](docs/yam_quickstart.md)。从本仓库根目录运行：
+新电脑先按[YAM完整指南](docs/yam_quickstart.md)安装系统工具和uv 0.11.24，
+再从本仓库根目录运行。安装器会固定Python、全部依赖、i2rt官方提交及两处既有退出补丁：
 
 ```bash
-# 安装轻量数采依赖并应用已验证的编码配置补丁；不要在录制中修改环境。
-uv pip install --python ../i2rt/.venv/bin/python -r scripts/requirements-yam-capture.txt
-../i2rt/.venv/bin/python scripts/apply_yam_robologger_patch.py
+bash scripts/setup_yam.sh
+bash scripts/check_yam.sh  # 无硬件检查；85项测试及4个subtests
 
-# 确认脚本DEVICES中的左右D405路径，以及can_left/can_right身份、1Mbit/s链路。
+cp config/yam-local.env.example config/yam-local.env
+# 编辑左右相机彩色节点；按指南建立can_left/can_right的设备映射。
+nano config/yam-local.env
+source config/yam-local.env
+
+# 确认左右D405路径，以及can_left/can_right身份、1Mbit/s链路。
 # 当前旧电脑流程测试显式使用150/100ms；不设置时入口默认80/50ms。
 CAMERA_MAX_AGE_MS=150 CAMERA_MAX_SKEW_MS=100 \
   bash scripts/collect_yam.sh --camera-only --duration 60
@@ -64,6 +70,9 @@ CAMERA_MAX_AGE_MS=150 CAMERA_MAX_SKEW_MS=100 \
 发布数据位于 `data/yam_bimanual_30hz/episode_XXXXX.zarr`，它引用同数据集下的原始
 `data/<session>/` 视频/状态，迁移时两者都需保留。日志在 `logs/yam_capture/` 和
 `logs/replay/`。本仓库上传代码、示例相机模式和验证摘要，不包含原始实验视频/数据。
+
+软件安装与模型加载已在独立Python环境验证；新电脑实际USB/CAN映射和带载多轮验收仍需现场完成。
+重力补偿短测、三姿态测试与PD保持诊断已随仓库提供，见[测试教程](docs/yam_gravity_tests.md)。
 
 ### Review建议入口
 

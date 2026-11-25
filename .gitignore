@@ -1,4 +1,8 @@
 .venv/
+.venv-yam/
+.venv-bootstrap/
+.yam-deps/
+config/yam-local.env
 .venv-pi/
 __pycache__/
 *.py[cod]

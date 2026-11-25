@@ -9,78 +9,141 @@
 [验证报告](validation/2026-11-25-yam.md)区分流程成功、时序限制和动态跟踪误差。
 现有旧电脑使用USB2连接；新主机及USB3链路尚未现场验证。
 
-## 1. 环境与依赖
+## 1. 从新电脑安装（不连接硬件也能完成）
 
-已验证：Ubuntu 24.04、Python 3.11.15、i2rt 1.1.2、NumPy 2.2.6、
-OpenCV 4.11.0.86、MuJoCo 4.0.1、python-can 4.5.0。
-采集附加依赖固定在 `scripts/requirements-yam-capture.txt`。
-YAM轻量运行环境与上游ARX的Python 3.10/训练环境分开，不需要为数采安装ARX SDK。
-
-推荐目录：
-
-```text
-workspace/
-├── i2rt/                 # 官方SDK，含 .venv（Python 3.11）
-└── flash-aloha_YAM/       # 本仓库
-```
-
-本次review版本在 `review/yam-collection-20261125` 分支，尚未合入main。
-新工作目录可以这样获取源码（已有仓库无需重复克隆）：
+支持并验证的软件环境：Ubuntu 24.04 x86_64、Python 3.11.15。
+需要联网下载源码、Python和依赖，预留约5GB磁盘空间。完整依赖固定在
+`scripts/requirements-yam-lock.txt`，包含数采、诊断、离线测试与绘图，不含PyTorch训练栈。
 
 ```bash
-git clone https://github.com/i2rt-robotics/i2rt.git
+sudo apt-get update
+sudo apt-get install -y git patch ffmpeg can-utils v4l-utils usbutils \
+  python3-venv build-essential libgl1 libegl1 libglfw3 libglib2.0-0
+
 git clone --branch review/yam-collection-20261125 https://github.com/Hzzzzs/flash-aloha_YAM.git
 cd flash-aloha_YAM
+
+# 已有uv 0.11.24可跳过这三行；工具环境与YAM运行环境分开。
+python3 -m venv .venv-bootstrap
+.venv-bootstrap/bin/python -m pip install uv==0.11.24
+export PATH="$PWD/.venv-bootstrap/bin:$PATH"
+
+bash scripts/setup_yam.sh
+bash scripts/check_yam.sh
 ```
 
-先准备官方 [i2rt SDK](https://github.com/i2rt-robotics/i2rt) 和系统工具
-`ffmpeg`、`patch`、`can-utils`、`v4l-utils`。从本仓库根目录安装采集依赖：
+安装器只安装软件：创建 `.venv-yam/` 和 `.yam-deps/i2rt/`，不打开CAN、相机或控制器。
+已有同名环境会按锁定清单同步，请不要把其他项目环境作为 `YAM_VENV_DIR`。
+无硬件检查验证依赖、补丁、FFmpeg编码器、Ultra2+linear_4310模型加载/FK及模拟测试。
+当前预期为85项测试通过（另有4个subtests）；这不等于真实机器人验收。
+安装与检查已在不含旧环境/SDK的独立目录执行通过，见[复现记录](validation/2026-11-25-reproduction.md)。
+
+SDK固定为官方提交 `ea116fe4079e991958b22f879874402674ee6590`（包版本1.1.2），
+安装器应用 `scripts/patches/i2rt-explicit-motor-disable.patch`，复现原实验环境的两处退出修改：
+先发送零力矩/零增益命令，停止控制线程后逐轴DISABLE，再关闭CAN。
+比对原本机SDK，官方跟踪文件中只有这两个Python文件存在差异；模型和默认重力参数与该提交一致。
+基线、修改前后哈希见 `scripts/patches/i2rt-source.json`；MIT许可随补丁保留。
+**这不是新改的控制策略，也不写电机零位。**
+
+安装器还从干净的robologger 0.1.7应用编码补丁。共享libx264路径使用
+ultrafast、1编码线程、1颜色转换线程、zerolatency、5Mbps；同码率画质尚未单独验收。
+不要另用 `pip install -U` 升级其中某个依赖后仍当成同一验证环境。
+
+新安装默认使用仓库内环境；已有实验室的相邻 `../i2rt/.venv/` 仍可回退使用。
+明确指定其他位置时：
 
 ```bash
-# SDK 尚未建环境时执行；已有工作环境不要重新创建。
-uv venv ../i2rt/.venv --python 3.11
-uv pip install --python ../i2rt/.venv/bin/python -e ../i2rt
-
-uv pip install --python ../i2rt/.venv/bin/python -r scripts/requirements-yam-capture.txt
-../i2rt/.venv/bin/python scripts/apply_yam_robologger_patch.py
-```
-
-本地验证过的SDK版本是1.1.2；迁移应保留当前SDK源码及修改，
-不要把任意更新的官方main自动视为同一已验证版本。
-上述SDK克隆获取官方当前源码；完整的干净机器安装复现尚未验收。
-补丁给robologger 0.1.7增加可配置的编码预设/线程数，不改变默认行为；
-本仓库libx264路径使用ultrafast、1编码线程、1颜色转换线程、zerolatency、5Mbps。
-已应用补丁时脚本不会重复修改；重新安装robologger后须重新应用。
-更快编码可能影响同码率画质，尚未做训练图像质量验收。
-
-启动器默认使用相邻SDK的Python。其他位置可设置：
-
-```bash
-export YAM_SDK_DIR=/absolute/path/to/i2rt
+export YAM_SDK_DIR=/absolute/path/to/pinned-and-patched/i2rt
 export YAM_PYTHON=/absolute/path/to/venv/bin/python
-bash scripts/collect_yam.sh --help
 ```
 
-## 2. 设备映射与零位
+`YAM_SDK_DIR`指定的SDK优先；安装阶段的环境目录可通过`YAM_VENV_DIR`设置。
+自定义安装目录后，运行时也需设置对应的上述两个变量。
+以下运行命令均在仓库根目录、激活所需设备配置的同一终端执行。
 
-| 项目 | 本机已验证配置 |
-| --- | --- |
-| 左/右臂 | `can_left` / `can_right`，独立CAN接口，1 Mbit/s |
-| 型号 | `yam_ultra_2` + `linear_4310` |
-| 左相机 | `pci-0000:00:14.0-usb-0:5.3:1.0-video-index4` |
-| 右相机 | `pci-0000:00:14.0-usb-0:5.4:1.0-video-index4` |
-| 数组顺序 | 左J1–J6、左夹爪、右J1–J6、右夹爪 |
-| 单位 | 关节rad；夹爪归一化0闭合/1打开 |
+## 2. 设备映射、权限与零位（操作员执行）
 
-相机路径位于 `scripts/record_yam.py` 的 `DEVICES`；换电脑/USB端口会变化。
-当前仍需现场确定左右身份并更新这两个路径，尚未实现自动迁移。
-`calibration/d405_640x480_30.npz`只提供模式设置，不是相机外参或手眼标定文件。
-CAN持久命名规则需在新机安装并核对序列号，不能假定系统的can0就是左臂。
+### 两台D405
 
-曾出现的右臂大幅重力补偿差异与零位偏差有关，修正后明显改善。
-经验是先检查物理参考姿态与关节读数，不要盲目增加力矩倍率。
-左右外观一致不证明零位一致；当前姿态也不应自动标成全零。
-现阶段右臂大幅前伸自由补偿仍有不足，已录制轨迹的主动回放不等于自由补偿验收。
+```bash
+v4l2-ctl --list-devices
+ls -l /dev/v4l/by-id/ /dev/v4l/by-path/
+lsusb -t
+# 对候选节点逐个检查；应支持YUYV或MJPG的640x480、30fps彩色流。
+v4l2-ctl -d /dev/videoX --list-formats-ext
+```
+
+不要依据video编号或固定index猜左右/彩色节点；逐台接入识别序列号与对应路径，
+再接好两台。优先用by-id，若重复/不可用再用by-path。新USB3链路应在`lsusb -t`
+显示5000M或更高；480M仍是USB2。实际是否稳定以采集日志为准。
+
+```bash
+cp config/yam-local.env.example config/yam-local.env
+# 编辑文件，填入确认过的左右彩色节点；该本机配置被Git忽略。
+nano config/yam-local.env
+source config/yam-local.env
+```
+
+`YAM_CAMERA_LEFT`和`YAM_CAMERA_RIGHT`覆盖设备路径，不改变30Hz、640×480或帧引用规则。
+未设置时保留旧实验室的by-path默认值，新电脑必须完成上面的映射。
+`.npz`相机文件只提供模式设置，里面的旧设备路径不覆盖显式选择；不是手眼/外参标定。
+用户需有video组权限：`sudo usermod -aG video "$USER"`，之后退出桌面会话并重新登录。
+回放使用OpenCV窗口，需在有显示器的Linux桌面终端执行；SSH无显示环境只能先做离线检查。
+
+原实验环境允许video组访问CPU唤醒延迟设备。若相机日志提示无法限制CPU延迟，可设置：
+
+```bash
+echo 'KERNEL=="cpu_dma_latency", GROUP="video", MODE="0660"' | sudo tee /etc/udev/rules.d/99-yam-latency.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=misc --sysname-match=cpu_dma_latency
+```
+
+### 两个USB-CAN接口
+
+两臂使用独立CAN接口。先逐个连接USB-CAN适配器，确认它连接的是哪只机械臂；控制程序必须退出。
+
+```bash
+ip -br link
+# 替换can0为刚识别到的接口；读取USB序列号，不发送电机命令。
+udevadm info --attribute-walk --path=/sys/class/net/can0
+```
+
+创建 `/etc/udev/rules.d/90-yam-can.rules`，用**实际USB适配器序列号**替换占位值：
+
+```text
+SUBSYSTEM=="net", ACTION=="add", ATTRS{serial}=="LEFT_ADAPTER_SERIAL", NAME="can_left"
+SUBSYSTEM=="net", ACTION=="add", ATTRS{serial}=="RIGHT_ADAPTER_SERIAL", NAME="can_right"
+```
+
+重载规则后，在无控制程序且机械臂已托稳/关闭电机电源的情况下重插USB-CAN；随后配置：
+
+```bash
+sudo udevadm control --reload-rules
+# 重插适配器后确认名称，再执行；这里不发送运动或标零命令。
+ip -br link
+sudo ip link set can_left down
+sudo ip link set can_left type can bitrate 1000000
+sudo ip link set can_left up
+sudo ip link set can_right down
+sudo ip link set can_right type can bitrate 1000000
+sudo ip link set can_right up
+ip -details -statistics link show can_left
+ip -details -statistics link show can_right
+```
+
+名称绑定跟随适配器，不跟随机械臂；如果左右电机线互换，还需重新核对。重启后接口可能需重新up。
+
+### 型号和零位
+
+本交付针对YAM Ultra 2 + linear_4310。状态顺序是左J1–J6、左夹爪、右J1–J6、右夹爪；
+关节rad，夹爪归一化0闭合/1打开。
+
+换电脑控制同一套机械臂无需重新标零。电机固件里的零位不是Python环境的一部分；
+换成另一套机械臂时，要先按厂家物理参考姿态确认自己的零位，不能复制实验室的角度读数作为偏移。
+SDK官方ping脚本包含使能/禁用操作，不能当成纯只读。教程和安装器不自动标零。
+
+曾出现的右臂重力补偿差异在修正零位后明显改善，现阶段大幅前伸仍有不足。
+先检查参考姿态与读数，再进行[重力补偿测试](yam_gravity_tests.md)；不要先盲增力矩倍率。
 
 ## 3. 相机检查（操作员执行）
 
@@ -134,13 +197,30 @@ Ctrl+C原地禁用，失去力矩前需托稳。不要与其他控制同一CAN�
 迁移后还需检查原始manifest的绝对输出路径及数据读取，不能假定原路径总有效。
 当前入口不单独录制回放过程的视频；示教视频和回放关节日志是两类证据。
 
+看到`Published:`才表示已发布；按菜单丢弃不应恢复成成功示教。
+用终端打印的实际episode路径进行离线读取验收：
+
+```bash
+.venv-yam/bin/python scripts/inspect_yam_episode.py \
+  data/yam_bimanual_30hz/episode_00000.zarr
+```
+
+将`episode_00000`换为本次实际编号。输出应包含(N,14)、同一行qpos动作标签、
+双路首/中/末640×480图像读取和实测采样率。
+满60秒且未提前停止的采集目标为1800条、约30Hz；查看会话日志`rate.json`与原始`manifest.json`，
+确认complete/retained/alignable和publication.complete，没有fatal_error，视频没有丢帧。
+提前手动停止时条数更少是正常的，不能单凭程序退出判为采集成功。
+
+第一次流程成功后，在同一时序配置下重复3轮完整任务，逐轮记录帧龄、偏斜、丢帧及采样率；
+这是现场复现记录，不替代任务精度或长期运行验收。超时后不要将失败原始数据当成通过样本。
+
 复用原生 `data_processing.episode_data.Episode` 读取，不能把发布目录当成内含
 所有数组的普通Zarr。最新成功数据已用该读取器检查，但尚未完成训练DataLoader/训练一步测试。
 
 统计一段回放（只读，不连接设备）：
 
 ```bash
-../i2rt/.venv/bin/python scripts/analyze_yam_replay.py \
+.venv-yam/bin/python scripts/analyze_yam_replay.py \
   logs/replay/2026-11-25/151327_20261125-151215-11545b/steps_000.npz
 ```
 
@@ -148,7 +228,7 @@ Ctrl+C原地禁用，失去力矩前需托稳。不要与其他控制同一CAN�
 关节误差用度，夹爪用归一化开度的百分点；同一tick发送目标后立即读取状态，
 包含运动滞后，不是静态零位或末端毫米精度。没有做时间平移来美化误差。
 
-可选曲线：安装 `scripts/requirements-yam-analysis.txt` 后，为分析命令增加
+安装器已包含绘图依赖；为分析命令增加
 `--plot /absolute/path/to/tracking.png`。这只生成离线图，不启动回放。
 
 ## 6. 下一阶段验收
@@ -162,5 +242,5 @@ Ctrl+C原地禁用，失去力矩前需托稳。不要与其他控制同一CAN�
 | 动态跟踪精度 | 已生成误差统计，尚未约定任务允许误差；不能凭回放完成判精度合格 |
 | 训练与自主操作 | 待YAM任务/模型配置、DataLoader和训练/部署验证 |
 
-迁移保留SDK、配置、依赖补丁、数据/日志和电机零位备份；不要迁移旧Python虚拟环境目录，
-应在新机重建。相机带载状态变动或零位再次修改后需重新验证，旧轨迹不能盲目复用。
+迁移保留本机设备配置、原始数据/日志和既有电机零位记录；SDK及依赖由固定版本安装器重建，
+不要复制旧Python虚拟环境目录。相机带载状态变动或零位再次修改后需重新验证，旧轨迹不能盲目复用。
