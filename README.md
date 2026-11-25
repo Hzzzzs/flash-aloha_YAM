@@ -6,7 +6,7 @@
 
 - **从这里开始：[YAM 安装、录制与迁移指南](docs/yam_quickstart.md)**
 - [重力补偿测试与参数诊断](docs/yam_gravity_tests.md)
-- [手动夹爪摩擦助力与调参（可选，待实机验证）](docs/yam_gripper_friction.md)
+- [手动夹爪摩擦/加速度助力与调参（可选，待实机验证）](docs/yam_gripper_friction.md)
 - **代码 review：[改动范围、数据流程与验证方式](docs/yam_review.md)**
 - [2026-11-25 实机验证与回放误差](docs/validation/2026-11-25-yam.md)
 - [独立目录安装与无硬件复现结果](docs/validation/2026-11-25-reproduction.md)
@@ -45,7 +45,7 @@ CAMERA_MAX_AGE_MS=150 CAMERA_MAX_SKEW_MS=100 bash scripts/collect_yam.sh --durat
 
 ```bash
 bash scripts/setup_yam.sh
-bash scripts/check_yam.sh  # 无硬件检查；112项测试及4个subtests
+bash scripts/check_yam.sh  # 无硬件检查；126项测试及4个subtests
 
 cp config/yam-local.env.example config/yam-local.env
 # 编辑左右相机彩色节点；按指南建立can_left/can_right的设备映射。

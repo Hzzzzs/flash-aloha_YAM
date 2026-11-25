@@ -22,13 +22,17 @@ from recording.practice_support import TerminalKeyWatcher
 
 
 def adjust(parameters, key):
+    if key == 'a':
+        return replace(parameters, acceleration_enabled=not parameters.acceleration_enabled)
     changes = {'+': ('coulomb_nm', .005, 0., parameters.max_torque_nm),
                '=': ('coulomb_nm', .005, 0., parameters.max_torque_nm),
                '-': ('coulomb_nm', -.005, 0., parameters.max_torque_nm),
                ']': ('viscous_nm_s_rad', .001, 0., .02),
                '[': ('viscous_nm_s_rad', -.001, 0., .02),
                '.': ('transition_rad_s', .05, .02, 2.),
-               ',': ('transition_rad_s', -.05, .02, 2.)}
+               ',': ('transition_rad_s', -.05, .02, 2.),
+               'u': ('acceleration_gain_nm_s2_rad', .0001, 0., .002),
+               'j': ('acceleration_gain_nm_s2_rad', -.0001, 0., .002)}
     if key not in changes:
         return parameters
     name, delta, low, high = changes[key]
@@ -62,7 +66,8 @@ def main():
                 controller = controllers[args.arm]
                 controller.configure_gripper_friction(parameters, enabled=False)
                 controller.enter_gripper_tuning()
-                print('1=assist ON/OFF; +/-=Coulomb 0.005 Nm; [/]=viscous; ,/.=transition speed; s=save; q=exit')
+                print('1=master ON/OFF; +/-=Coulomb 0.005 Nm; [/]=viscous; ,/.=transition speed; '
+                      'a=acceleration ON/OFF; u/j=acceleration gain +/-0.0001; s=save; q=exit')
                 print('Release the handle briefly between trials: unwanted self-motion means press 1 OFF and reduce compensation.')
                 next_status = 0.
                 while True:
@@ -90,6 +95,8 @@ def main():
                         print(f'{"ON" if enabled else "OFF"} Fc={parameters.coulomb_nm:.3f} Nm '
                               f'B={parameters.viscous_nm_s_rad:.3f} Nm*s/rad '
                               f'v0={parameters.transition_rad_s:.2f} rad/s '
+                              f'accel={"ON" if parameters.acceleration_enabled else "OFF"} '
+                              f'Ka={parameters.acceleration_gain_nm_s2_rad:.4f} Nm*s^2/rad '
                               f'assist={controller._assist_torque:+.4f} Nm (command, not measured force)')
                         next_status = time.monotonic() + 1.
                     time.sleep(.02)

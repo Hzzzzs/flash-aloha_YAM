@@ -16,6 +16,7 @@ from typing import Any, Callable
 import numpy as np
 
 from hardware.arm_interface import ArmDescription, ArmState, ManagedArm
+from hardware.yam_gripper_friction import AccelerationEstimator
 
 
 ARM_DOF = 6
@@ -118,6 +119,7 @@ class YAMController:
         self._gripper_position_control = True
         self._assist_deadline = None
         self._assist_torque = 0.0
+        self._assist_acceleration = AccelerationEstimator()
         self._base_kp = np.asarray(robot._kp, dtype=float).copy()
         self._base_kd = np.asarray(robot._kd, dtype=float).copy()
         self._passive_kd = np.asarray(robot._grav_comp_kd, dtype=float).copy()
@@ -183,6 +185,7 @@ class YAMController:
     def enter_passive(self) -> None:
         with self._lock:
             self._require_live()
+            self._clear_gripper_assist()
             self.robot.enter_gravity_comp_idle()
             self._gripper_position_control = False
             self._assist_torque = 0.0
@@ -216,6 +219,7 @@ class YAMController:
             self._mode, self._deadline = 'gripper_tuning', None
 
     def _clear_gripper_assist(self):
+        self._assist_acceleration.reset()
         if self._gripper_friction is not None:
             with self.robot._command_lock:
                 self.robot._commands.torques[ARM_DOF] = 0.0
@@ -237,13 +241,18 @@ class YAMController:
         if not np.isfinite(timestamp) or not 0 <= time.time() - timestamp <= 0.1:
             raise RuntimeError('Gripper assist feedback is stale or has an invalid clock')
         motor_velocity = float(self.robot.remapper.to_robot_joint_vel_space(dq)[ARM_DOF])
-        torque = self._gripper_friction.torque(float(q[ARM_DOF]), float(dq[ARM_DOF]), motor_velocity)
+        parameters = self._gripper_friction
+        acceleration = (self._assist_acceleration.update(
+            motor_velocity, timestamp, parameters.acceleration_filter_s)
+            if parameters.acceleration_enabled else 0.0)
+        torque = parameters.torque(float(q[ARM_DOF]), float(dq[ARM_DOF]), motor_velocity, acceleration)
         with self.robot._command_lock:
             # The pinned public command_joint_state ignores a "torques" field.
             # Use its existing command lock and touch ONLY J7 feedforward.
             command = self.robot._commands
             if command.kp[ARM_DOF] != 0:
                 torque = 0.0
+                self._assist_acceleration.reset()
             command.torques[ARM_DOF] = torque
         self._assist_torque = torque
 

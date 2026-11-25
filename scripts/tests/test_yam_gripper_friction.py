@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from hardware.backends.yam import YAMController
-from hardware.yam_gripper_friction import GripperFriction, load_config, save_config
+from hardware.yam_gripper_friction import AccelerationEstimator, GripperFriction, load_config, save_config
 
 
 class Robot:
@@ -166,3 +166,106 @@ def test_sdk_shutdown_still_runs_if_assist_clear_fails(make_controller):
     with pytest.raises(TypeError):
         c.close()
     assert r.closed
+
+
+def test_acceleration_estimator_actual_time_duplicates_noise_and_restart():
+    estimator = AccelerationEstimator()
+    assert estimator.update(0., 10., .04) == 0
+    expected = 10 * (1 - np.exp(-.01 / .04))
+    assert estimator.update(.1, 10.01, .04) == pytest.approx(expected)
+    assert estimator.update(.1, 10.01, .04) == pytest.approx(expected)
+    assert estimator.update(.1, 10.01001, .04) == pytest.approx(expected)
+    assert estimator.update(.3, 10.03, .04) == pytest.approx(
+        expected + (1 - np.exp(-.02 / .04)) * (10 - expected))
+    assert estimator.update(5., 11., .04) == 0  # Gap: no kick on resumption.
+    assert estimator.update(3., 9., .04) == 0  # Clock discontinuity.
+    estimator.reset()
+    assert estimator.update(1., 12., .04) == 0
+    for i in range(1, 101):
+        accel = estimator.update(1. + (-1)**i * .001, 12 + i * .01, .04)
+        assert abs(accel) < .5  # Small alternating noise stays inside deadband.
+
+
+def test_acceleration_shared_cap_direction_deadband_and_endpoints():
+    p = GripperFriction(acceleration_enabled=True, acceleration_gain_nm_s2_rad=.001)
+    assert p.torque(.5, .1, 1., 10.) == pytest.approx(.0095)
+    assert p.torque(.5, -.1, -1., -10.) == pytest.approx(-.0095)
+    assert p.torque(.5, .1, 1., -.1) == 0  # No amplification of braking.
+    assert p.torque(.5, .1, 1., .4) == 0
+    assert p.torque(.5, 0., 0., 100.) == 0
+    assert p.torque(1., .1, 1., 100.) == 0
+    assert p.torque(1., -.1, -1., -10.) == pytest.approx(-.0095)
+    assert replace(p, acceleration_enabled=False).torque(.5, .1, 1., 100.) == 0
+    combined = replace(p, coulomb_nm=.02, viscous_nm_s_rad=.01)
+    assert combined.torque(.5, .1, 1., 100.) == .03
+    assert combined.torque(.99, .1, 1., 100.) == pytest.approx(.006)
+
+
+@pytest.mark.parametrize('values', [dict(acceleration_enabled=1),
+    dict(acceleration_gain_nm_s2_rad=-.001), dict(acceleration_gain_nm_s2_rad=.003),
+    dict(acceleration_filter_s=0), dict(acceleration_deadband_rad_s2=0),
+    dict(acceleration_gain_nm_s2_rad=float('inf'))])
+def test_invalid_acceleration_parameters(values):
+    with pytest.raises(ValueError):
+        GripperFriction(**values)
+
+
+@pytest.mark.parametrize('span', [6.57, -6.57])
+@pytest.mark.parametrize('direction', [1., -1.])
+def test_acceleration_controller_motor_coordinates_and_mode_reset(make_controller, monkeypatch, span, direction):
+    c, r, clock = make_controller(span)
+    monkeypatch.setattr('hardware.backends.yam.time.time', lambda: 100.05)
+    p = GripperFriction(acceleration_enabled=True, acceleration_gain_nm_s2_rad=.0001)
+    c.configure_gripper_friction(p)
+    r._commands.torques[:6] = np.arange(6)
+    r._joint_state.timestamp = 100.
+    r._joint_state.vel[6] = direction * .01
+    c._update_gripper_assist()
+    assert r._commands.torques[6] == 0
+    r._joint_state.timestamp += .01
+    r._joint_state.vel[6] = direction * .1
+    c._update_gripper_assist()
+    assert np.sign(r._commands.torques[6]) == np.sign(span * direction)
+    np.testing.assert_array_equal(r._commands.torques[:6], np.arange(6))
+    c.hold_current()
+    assert c._assist_acceleration.previous is None
+    c.enter_passive()
+    r._joint_state.timestamp += .01
+    r._joint_state.vel[6] = direction * .5
+    c._update_gripper_assist()
+    assert r._commands.torques[6] == 0  # First sample after mode switch.
+    clock[0] += .6
+    c._update_gripper_assist()
+    assert c._assist_acceleration.previous is None
+    c.check()
+    c._update_gripper_assist()
+    assert r._commands.torques[6] == 0
+    c.configure_gripper_friction(p, enabled=False)
+    assert c._assist_acceleration.previous is None
+
+
+def test_acceleration_config_v2_and_legacy_v1(tmp_path):
+    path = tmp_path / 'assist.json'
+    p = GripperFriction(acceleration_enabled=True, acceleration_gain_nm_s2_rad=.0001)
+    save_config(path, 'right', p)
+    assert json.loads(path.read_text())['schema_version'] == 2
+    assert load_config(path)['right'] == p
+    document = json.loads(path.read_text())
+    document['schema_version'] = 1
+    document['arms']['right'] = {'coulomb_nm': .02}
+    path.write_text(json.dumps(document))
+    legacy = load_config(path)['right']
+    assert legacy.coulomb_nm == .02
+    assert not legacy.acceleration_enabled
+    assert legacy.acceleration_gain_nm_s2_rad == 0
+
+
+def test_tuner_acceleration_toggle_and_gain_steps():
+    from tune_yam_gripper import adjust
+    p = GripperFriction()
+    p = adjust(adjust(p, 'u'), 'a')
+    assert p.acceleration_enabled
+    assert p.acceleration_gain_nm_s2_rad == .0001
+    assert adjust(p, 'j').acceleration_gain_nm_s2_rad == 0
+    assert not adjust(p, 'a').acceleration_enabled
+    assert adjust(replace(p, acceleration_gain_nm_s2_rad=.002), 'u').acceleration_gain_nm_s2_rad == .002
