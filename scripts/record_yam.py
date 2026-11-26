@@ -271,7 +271,7 @@ def main():
                     if backend:
                         metadata['robot_contract'] = ROBOT_CONTRACT
                         metadata['manual_gripper_friction'] = dict(
-                            algorithm='velocity_tanh_filtered_acceleration_v2', torque_units='Nm',
+                            algorithm='velocity_acceleration_opening_bias_v3', torque_units='Nm',
                             velocity_units='SDK_motor_coordinate_rad_s',
                             arms={role: asdict(parameters) for role, parameters in friction.items()})
                     recorder.start_episode(EpisodeRequest(

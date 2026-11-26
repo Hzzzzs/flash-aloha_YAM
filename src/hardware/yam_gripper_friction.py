@@ -22,6 +22,8 @@ class GripperFriction:
     acceleration_gain_nm_s2_rad: float = 0.0
     acceleration_deadband_rad_s2: float = 0.5
     acceleration_filter_s: float = 0.04
+    opening_bias_nm: float = 0.0
+    opening_speed_limit_s: float = 0.5
 
     def __post_init__(self):
         for field in fields(self):
@@ -40,7 +42,9 @@ class GripperFriction:
                 and 0.02 <= self.end_margin <= 0.2
                 and 0 <= self.acceleration_gain_nm_s2_rad <= 0.002
                 and 0.1 <= self.acceleration_deadband_rad_s2 <= 20
-                and 0.02 <= self.acceleration_filter_s <= 0.2):
+                and 0.02 <= self.acceleration_filter_s <= 0.2
+                and 0 <= self.opening_bias_nm <= 1.5
+                and 0.05 <= self.opening_speed_limit_s <= 1.0):
             raise ValueError('Gripper friction parameter outside supported tuning limits')
 
     def torque(self, opening, normalized_velocity, motor_velocity, acceleration=0.0,
@@ -65,12 +69,15 @@ class GripperFriction:
         if self.acceleration_enabled and speed > 0 and acceleration * velocity > 0:
             accel = math.copysign(max(0., abs(acceleration) - self.acceleration_deadband_rad_s2), acceleration)
             torque += self.acceleration_gain_nm_s2_rad * accel
-        torque += pulse_nm
+        # A fixed OPEN preference works at rest; pulling closed opposes this bias.
+        # Reduce the drive as opening speed rises, without creating closing torque.
+        opening_bias = self.opening_bias_nm * max(0., 1. - max(0., normalized_velocity) / self.opening_speed_limit_s)
+        torque += pulse_nm + opening_bias * motor_opening_sign
         if diagnostics is not None:
             diagnostics.update(raw_nm=torque, capped=abs(torque) > self.max_torque_nm)
         torque = max(-self.max_torque_nm, min(self.max_torque_nm, torque))
         # Taper only toward the approached stop; still allow retreat from it.
-        direction = torque * motor_opening_sign if pulse_nm else normalized_velocity
+        direction = torque * motor_opening_sign if (pulse_nm or self.opening_bias_nm) else normalized_velocity
         distance = 1 - opening if direction > 0 else opening
         return torque * min(1.0, max(0.0, distance / self.end_margin))
 
@@ -110,9 +117,9 @@ class AccelerationEstimator:
 def load_config(path):
     document = json.loads(Path(path).read_text())
     if (set(document) != {'schema_version', 'robot', 'gripper', 'arms'}
-            or document['schema_version'] not in (1, 2) or document['robot'] != 'yam_ultra_2'
+            or document['schema_version'] not in (1, 2, 3) or document['robot'] != 'yam_ultra_2'
             or document['gripper'] != 'linear_4310'):
-        raise ValueError('Expected YAM Ultra 2 / linear_4310 assist config v1 or v2')
+        raise ValueError('Expected YAM Ultra 2 / linear_4310 assist config v1, v2 or v3')
     arms = document['arms']
     if not isinstance(arms, dict) or not arms or set(arms) - {'left', 'right'}:
         raise ValueError('Friction config must name left and/or right arms')
@@ -125,7 +132,7 @@ def save_config(path, role, parameters):
     path = Path(path)
     arms = load_config(path) if path.exists() else {}
     arms[role] = parameters
-    document = dict(schema_version=2, robot='yam_ultra_2', gripper='linear_4310',
+    document = dict(schema_version=3, robot='yam_ultra_2', gripper='linear_4310',
                     arms={name: asdict(value) for name, value in arms.items()})
     path.parent.mkdir(parents=True, exist_ok=True)
     from recording.recording_utils import atomic_write_json

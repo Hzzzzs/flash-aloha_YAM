@@ -16,7 +16,7 @@
 | --- | --- |
 | `scripts/setup_yam.sh`、`scripts/check_yam.sh` | 固定SDK提交、退出补丁、完整Python依赖及无硬件检查 |
 | `scripts/08_*`、`scripts/10_*`、`scripts/13_*` | 原重力补偿测试迁入；Python控制逻辑不变，启动器适配仓库路径 |
-| `scripts/tune_yam_gripper.py`、`src/hardware/yam_gripper_friction.py` | 可选夹爪速度摩擦/加速度助力，单臂调参与零速短脉冲诊断；实机参数尚待验证 |
+| `scripts/tune_yam_gripper.py`、`src/hardware/yam_gripper_friction.py` | 可选夹爪速度摩擦/加速度助力、松手张开，单臂调参与零速短脉冲诊断；实机参数尚待验证 |
 | `scripts/collect_yam.sh` | 仓库内启动器、Python/SDK位置和显式时序配置 |
 | `scripts/record_yam.py` | 相机启动、标准观测、录制/保存/回放状态流程，默认手动夹爪 |
 | `src/hardware/backends/yam.py` | SDK适配、同一状态对象读取qpos/qvel、夹爪归一化、命令看门狗、回放与退出 |
@@ -76,7 +76,7 @@ flowchart LR
 ## 验证
 
 初版核心无硬件测试76项通过；补齐复现后，独立环境85项及4个subtests通过，含重力诊断和退出测试。
-新增夹爪加速度助力后，固定环境141项及4个subtests通过；历史抓放实机证据均来自无助力配置。
+新增松手张开模式后，现场环境完整测试清单164项及4个subtests通过；历史抓放实机证据均来自无助力配置。
 固定SDK、依赖安装、模型FK和FFmpeg检查见[安装指南](yam_quickstart.md)。
 [独立目录复现记录](validation/2026-11-25-reproduction.md)说明实际运行范围及硬件验收边界。
 

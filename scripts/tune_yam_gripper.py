@@ -39,22 +39,34 @@ def adjust(parameters, key):
     return replace(parameters, **{name: round(max(low, min(high, getattr(parameters, name) + delta)), 6)})
 
 
+def adjust_opening_bias(parameters, key):
+    if key not in ('n', 'm'):
+        return parameters
+    value = parameters.opening_bias_nm + (.005 if key == 'n' else -.005)
+    return replace(parameters, opening_bias_nm=round(max(0., min(parameters.max_torque_nm, value)), 6))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--arm', choices=['left', 'right'], required=True)
     parser.add_argument('--config', type=Path, default=ROOT / 'config/yam-gripper-friction.json')
     parser.add_argument('--max-assist-torque', type=float, help='Explicit total assist cap in Nm, up to ARX reference 1.5')
-    parser.add_argument('--breakaway-test', action='store_true',
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--breakaway-test', action='store_true',
                         help='Start with zero motion assistance; enable b/v 150ms opening/closing test pulses')
+    modes.add_argument('--spring-open', action='store_true',
+                       help='Isolated release-to-open trial: start with 0.03 Nm OPEN bias, master OFF; n/m adjust')
     args = parser.parse_args()
     parameters = (load_config(args.config).get(args.arm, GripperFriction())
-                  if args.config.exists() and not args.breakaway_test else GripperFriction())
+                  if args.config.exists() and not (args.breakaway_test or args.spring_open) else GripperFriction())
     if args.max_assist_torque is not None:
         try:
             parameters = replace(parameters, max_torque_nm=args.max_assist_torque)
         except ValueError as exc:
             parser.error(str(exc))
     pulse_magnitude = min(.03, parameters.max_torque_nm)
+    if args.spring_open:
+        parameters = replace(parameters, opening_bias_nm=min(.03, parameters.max_torque_nm))
     print(f'Only {args.arm} arm (can_{args.arm}) will connect. Stop other CAN controllers first.')
     print('Support the arm; clear the gripper for startup calibration. Then arm joints HOLD the current pose.')
     print('Assistance starts OFF. q closes motors in place: support the arm BEFORE q.')
@@ -62,6 +74,9 @@ def main():
     if args.breakaway_test:
         print('Breakaway test: b=OPEN pulse, v=CLOSE pulse; n/m=pulse +/-0.005 Nm; duration 0.15 s.')
         print('Pulses actively move the gripper even at rest. Keep fingers outside jaws; use external handle only.')
+    if parameters.opening_bias_nm:
+        print('Release-to-open bias: gripper may OPEN without hand input; closing requires opposing the bias.')
+        print('Released objects will not remain gripped. Keep fingers outside jaws/linkages.')
     if input('Type YAM_GRIPPER_READY to connect: ').strip() != 'YAM_GRIPPER_READY':
         return
     controllers = {}
@@ -79,9 +94,13 @@ def main():
                 controller = controllers[args.arm]
                 controller.configure_gripper_friction(parameters, enabled=False)
                 controller.enter_gripper_tuning()
-                print('1=master ON/OFF; +/-=Coulomb 0.005 Nm; [/]=viscous; ,/.=transition speed; '
-                      'a=acceleration ON/OFF; u/j=acceleration gain +/-0.0001; s=save; q=exit')
-                print('Release the handle briefly between trials: unwanted self-motion means press 1 OFF and reduce compensation.')
+                if args.spring_open:
+                    print('1=master ON/OFF; n/m=OPEN bias +/-0.005 Nm; s=save; q=exit. Other assistance stays zero.')
+                    print('Slow opening on release is intended; jerky/fast opening means press 1 OFF and reduce bias.')
+                else:
+                    print('1=master ON/OFF; +/-=Coulomb 0.005 Nm; [/]=viscous; ,/.=transition speed; '
+                          'a=acceleration ON/OFF; u/j=acceleration gain +/-0.0001; s=save; q=exit')
+                    print('With nonzero OPEN bias, opening on release is intended; otherwise self-motion means reduce compensation.')
                 next_status = 0.
                 while True:
                     controller.check()  # Also renews the 0.5 s assist heartbeat.
@@ -108,7 +127,7 @@ def main():
                         save_config(args.config, args.arm, parameters)
                         print(f'Saved {args.arm} parameters to {args.config}. Collection requires explicit --gripper-friction-config.')
                     else:
-                        updated = adjust(parameters, key)
+                        updated = (adjust_opening_bias(parameters, key) if args.spring_open else adjust(parameters, key))
                         changed = updated != parameters
                         parameters = updated
                     if changed:
@@ -125,6 +144,7 @@ def main():
                               f'v0={parameters.transition_rad_s:.2f} rad/s '
                               f'accel={"ON" if parameters.acceleration_enabled else "OFF"} '
                               f'Ka={parameters.acceleration_gain_nm_s2_rad:.4f} Nm*s^2/rad '
+                              f'open_bias={parameters.opening_bias_nm:.3f} Nm '
                               f'assist={controller._assist_torque:+.4f} Nm '
                               f'peak={stats["peak_command_nm"]:.4f} Nm '
                               f'capped={stats["capped_ticks"]}/{stats["ticks"]} (command, not measured force)')

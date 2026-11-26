@@ -248,7 +248,7 @@ def test_acceleration_config_v2_and_legacy_v1(tmp_path):
     path = tmp_path / 'assist.json'
     p = GripperFriction(acceleration_enabled=True, acceleration_gain_nm_s2_rad=.0001)
     save_config(path, 'right', p)
-    assert json.loads(path.read_text())['schema_version'] == 2
+    assert json.loads(path.read_text())['schema_version'] == 3
     assert load_config(path)['right'] == p
     document = json.loads(path.read_text())
     document['schema_version'] = 1
@@ -354,3 +354,77 @@ def test_saturation_diagnostics_reports_unclipped_request(make_controller):
     assert stats['peak_raw_nm'] > .03
     assert stats['peak_command_nm'] == .03
     assert stats['capped_ticks'] == 1
+
+
+@pytest.mark.parametrize('sign', [1., -1.])
+def test_opening_bias_at_rest_closing_speed_rolloff_and_endpoints(sign):
+    p = GripperFriction(opening_bias_nm=.02)
+    def torque(q, v):
+        return p.torque(q, v, v * sign * 6.57, motor_opening_sign=sign)
+    assert torque(.5, 0.) == pytest.approx(sign * .02)
+    assert torque(0., 0.) == pytest.approx(sign * .02)  # Opens from fully closed.
+    assert torque(.5, -.1) == pytest.approx(sign * .02)  # Never assists closing.
+    assert torque(.5, .25) == pytest.approx(sign * .01)
+    assert torque(.5, .5) == 0
+    assert torque(.5, .6) == 0  # No reverse torque above rolloff speed.
+    assert torque(.99, 0.) == pytest.approx(sign * .004)
+    assert torque(1., 0.) == 0
+    assert torque(1., -.1) == 0  # Taper follows torque, not closing velocity.
+    assert replace(p, opening_bias_nm=.2).torque(.5, 0., 0., motor_opening_sign=sign) == sign * .03
+
+
+@pytest.mark.parametrize('span', [6.57, -6.57])
+@pytest.mark.parametrize('transition', ['off', 'hold', 'replay', 'keyboard', 'safe_stop', 'heartbeat', 'fault', 'close'])
+def test_opening_bias_controller_direction_clear_and_arm_unchanged(make_controller, span, transition):
+    c, r, clock = make_controller(span)
+    c.configure_gripper_friction(GripperFriction(opening_bias_nm=.02))
+    c.enter_gripper_tuning()
+    r._joint_state.vel[:] = 0
+    r._commands.torques[:6] = np.arange(6)
+    gains = r._commands.kp.copy(), r._commands.kd.copy()
+    c._update_gripper_assist()
+    assert r._commands.torques[6] == pytest.approx(np.sign(span) * .02)
+    np.testing.assert_array_equal(r._commands.torques[:6], np.arange(6))
+    np.testing.assert_array_equal(r._commands.kp, gains[0])
+    np.testing.assert_array_equal(r._commands.kd, gains[1])
+    if transition == 'off': c.configure_gripper_friction(c._gripper_friction, enabled=False)
+    elif transition == 'hold': c.hold_current()
+    elif transition == 'replay': c.command_target(r._joint_state.pos)
+    elif transition == 'keyboard':
+        c.enter_passive()
+        c.command_passive_gripper(.5)
+    elif transition == 'safe_stop': c.enter_safe_stop()
+    elif transition == 'close': c.close()
+    elif transition == 'heartbeat':
+        clock[0] += .6
+        c._update_gripper_assist()
+    else:
+        r._joint_state.timestamp -= 1
+        c._stop.wait = Mock(side_effect=[False, True])
+        c._watch()
+    assert r._commands.torques[6] == 0
+
+
+@pytest.mark.parametrize('values', [dict(opening_bias_nm=-.01), dict(opening_bias_nm=1.51),
+                                  dict(opening_speed_limit_s=0), dict(opening_bias_nm=float('nan'))])
+def test_invalid_opening_bias(values):
+    with pytest.raises(ValueError): GripperFriction(**values)
+
+
+def test_opening_bias_config_and_tuning(tmp_path):
+    from tune_yam_gripper import adjust_opening_bias
+    p = GripperFriction(opening_bias_nm=.03, max_torque_nm=1.5)
+    assert adjust_opening_bias(p, 'n').opening_bias_nm == .035
+    assert adjust_opening_bias(p, 'm').opening_bias_nm == .025
+    assert adjust_opening_bias(p, '+') == p  # Isolated trial cannot add velocity assistance.
+    assert adjust_opening_bias(replace(p, opening_bias_nm=0.), 'm').opening_bias_nm == 0
+    assert adjust_opening_bias(replace(p, opening_bias_nm=1.5), 'n').opening_bias_nm == 1.5
+    path = tmp_path / 'assist.json'
+    save_config(path, 'right', p)
+    assert load_config(path)['right'] == p
+    document = json.loads(path.read_text())
+    document['schema_version'] = 2
+    document['arms']['right'].pop('opening_bias_nm')
+    document['arms']['right'].pop('opening_speed_limit_s')
+    path.write_text(json.dumps(document))
+    assert load_config(path)['right'].opening_bias_nm == 0
