@@ -206,8 +206,11 @@ def test_stopped_camera_fails_closed_while_other_readers_advance(cache, sources)
     before = cache.snapshot(names)[1]
     sources.flags(frozen=['video_left'])
     time.sleep(.09)
-    with pytest.raises(CameraTimingError, match='video_left: frame age'):
+    with pytest.raises(CameraTimingError, match='video_left: frame age') as failure:
         cache.snapshot(names)
+    diagnostic = json.loads(str(failure.value).split('; snapshot_timing=', 1)[1])
+    assert diagnostic['video_left']['frame_number'] >= before['cameras']['video_left']['frame_number']
+    assert diagnostic['video_left']['consumer_to_snapshot_ms'] > 50
     after = cache.snapshot(['video_right'])[1]
     assert after['cameras']['video_right']['frame_number'] > before['cameras']['video_right']['frame_number']
 

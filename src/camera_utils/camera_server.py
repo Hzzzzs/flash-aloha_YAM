@@ -187,6 +187,7 @@ def resolve_camera_config(
     fallback_height: int = 720,
     fallback_fps: float = 50,
     params_path: str | None = None,
+    use_default_controls: bool = True,
 ) -> CameraConfig:
     params_path = params_path or get_camera_params_npz_path()
     record = find_camera_param_record(name, device_path, params_path)
@@ -194,7 +195,7 @@ def resolve_camera_config(
     saved_settings = record.get("settings", {}) if record else {}
 
     saved_width, saved_height, saved_fps = saved_mode or (None, None, None)
-    settings = dict(DEFAULT_CONTROL_SETTINGS)
+    settings = dict(DEFAULT_CONTROL_SETTINGS) if use_default_controls else {}
     settings.update({key: int(value) for key, value in saved_settings.items()})
 
     return CameraConfig(
@@ -443,7 +444,7 @@ def _xioctl(fd: int, request: int, arg) -> None:
 
 
 class V4L2MmapCamera:
-    """Native V4L2 mmap MJPG reader that returns decoded BGR frames."""
+    """Native V4L2 mmap MJPG/YUYV reader with original driver timestamps."""
 
     def __init__(
         self,
@@ -459,6 +460,8 @@ class V4L2MmapCamera:
         self.width = int(width)
         self.height = int(height)
         self.fps = float(fps)
+        self.pixel_format = V4L2_PIX_FMT_MJPEG
+        self.bytesperline = 0
         self.controls = dict(controls or {})
         self.buffer_count = max(2, int(buffer_count))
         self.read_timeout_s = max(0.001, float(read_timeout_s))
@@ -514,9 +517,12 @@ class V4L2MmapCamera:
 
         try:
             dequeue_time = time.monotonic()
+            if buf.flags & 0x0040:  # V4L2_BUF_FLAG_ERROR: corrupted buffer
+                print(f'[ReadFail] {self.device_path}: driver marked frame {buf.sequence} '
+                      f'corrupt (bytesused={buf.bytesused}, flags={buf.flags:#x})')
+                return False, None, 0.0
             data = bytes(self.buffers[buf.index][: buf.bytesused])
-            encoded = np.frombuffer(data, dtype=np.uint8)
-            frame = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+            frame = self._decode_frame(data)
             decode_time = time.monotonic()
             timestamp = float(buf.timestamp.tv_sec) + float(buf.timestamp.tv_usec) / 1_000_000.0
             timestamp = driver_timestamp(timestamp, int(buf.flags))
@@ -530,6 +536,22 @@ class V4L2MmapCamera:
             return True, frame, timestamp
         finally:
             _xioctl(self.fd, VIDIOC_QBUF, buf)
+
+    def _decode_frame(self, data):
+        if self.pixel_format == V4L2_PIX_FMT_MJPEG:
+            return cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if self.pixel_format == _fourcc("YUYV"):
+            stride = self.bytesperline or self.width * 2
+            if self.width % 2 or stride < self.width * 2:
+                raise RuntimeError("Invalid YUYV frame dimensions/stride")
+            if len(data) < stride * self.height:
+                print(f'[ReadFail] {self.device_path}: short YUYV frame '
+                      f'({len(data)} bytes, expected {stride * self.height})')
+                return None  # Same failed-read path as an undecodable MJPEG frame.
+            rows = np.frombuffer(data, dtype=np.uint8, count=stride * self.height).reshape(self.height, stride)
+            pixels = rows[:, :self.width * 2].copy().reshape(self.height, self.width, 2)
+            return cv2.cvtColor(pixels, cv2.COLOR_YUV2BGR_YUY2)
+        raise RuntimeError(f"Unsupported negotiated V4L2 format: {self.pixel_format:#x}")
 
     def get(self, prop_id: int) -> float:
         if prop_id == cv2.CAP_PROP_FRAME_WIDTH:
@@ -579,6 +601,10 @@ class V4L2MmapCamera:
         fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG
         fmt.fmt.pix.field = V4L2_FIELD_ANY
         _xioctl(self.fd, VIDIOC_S_FMT, fmt)
+        self.pixel_format = int(fmt.fmt.pix.pixelformat)
+        self.bytesperline = int(fmt.fmt.pix.bytesperline)
+        if self.pixel_format not in (V4L2_PIX_FMT_MJPEG, _fourcc("YUYV")):
+            raise RuntimeError(f"Unsupported negotiated V4L2 format: {self.pixel_format:#x}")
         self.width = int(fmt.fmt.pix.width)
         self.height = int(fmt.fmt.pix.height)
 
@@ -791,6 +817,11 @@ def _build_camera_video_logger(cam_name, width, height, fps, endpoint_base, code
                     "height": height,
                     "fps": fps,
                     "type": "rgb",
+                    # robologger 0.1.7 encoder-options patch (scripts/patches).
+                    # Bound dual-stream CPU work and avoid encoder lookahead queues.
+                    **({"encoder_preset": "ultrafast", "encoder_threads": 1,
+                        "encoder_tune": "zerolatency", "filter_threads": 1}
+                       if codec == "libx264" else {}),
                 }
             }
         },
@@ -1510,6 +1541,8 @@ def run_camera_server(
     recording_warmup_frames=5,
     read_fail_threshold=15,
     reopen_backoff_ms=200,
+    device=None,
+    use_default_controls=True,
 ):
     """Run a single-camera capture loop in this process."""
     global shutdown_requested
@@ -1525,7 +1558,7 @@ def run_camera_server(
         print(f"Valid options: {sorted(CAMERA_DEVICES.keys())}")
         return 1
 
-    device_path = CAMERA_DEVICES[camera_name]
+    device_path = device or CAMERA_DEVICES[camera_name]
     camera_config = resolve_camera_config(
         name=camera_name,
         device_path=device_path,
@@ -1535,6 +1568,7 @@ def run_camera_server(
         fallback_width=DEFAULT_WIDTH,
         fallback_height=DEFAULT_HEIGHT,
         fallback_fps=DEFAULT_FPS,
+        use_default_controls=use_default_controls,
     )
 
     target_fps = float(camera_config.fps)
@@ -1576,7 +1610,8 @@ def run_camera_server(
         f"Mode: {info['width']}x{info['height']} @ requested {target_fps:.3f} FPS "
         f"(driver reports {capture_fps_label:.3f} FPS)"
     )
-    print("Pixel format: MJPG via native V4L2 mmap, decoded to BGR")
+    pixel_name = int(cap.pixel_format).to_bytes(4, "little").decode("ascii", errors="replace")
+    print(f"Pixel format: {pixel_name} via native V4L2 mmap, decoded to BGR")
     if getattr(cap, "applied_controls", None):
         applied = ", ".join(
             f"{name}={value}" for name, value in sorted(cap.applied_controls.items())
@@ -2024,6 +2059,9 @@ def main():
             "Delay before camera reopen attempts in milliseconds (default: 200)."
         ),
     )
+    parser.add_argument("--device", help="Explicit V4L2 device, preferably a stable /dev/v4l/by-path link")
+    parser.add_argument("--no-default-controls", action="store_true",
+                        help="Apply only saved controls; omit generic webcam presets (for D405)")
     args = parser.parse_args()
 
     try:
@@ -2053,6 +2091,8 @@ def main():
             recording_warmup_frames=args.recording_warmup_frames,
             read_fail_threshold=args.read_fail_threshold,
             reopen_backoff_ms=args.reopen_backoff_ms,
+            device=args.device,
+            use_default_controls=not args.no_default_controls,
         )
 
 

@@ -1,4 +1,90 @@
-# Flash ALOHA: Learning Fast and Precise Manipulation
+# Flash ALOHA on YAM Ultra 2
+
+本仓库适配 i2rt YAM Ultra 2 双臂与 linear_4310 夹爪，复用 Flash ALOHA 的
+观测、录制、帧引用和回放流程。当前已完成真实双臂手动示教、双腕 RGB 数采和轨迹回放；
+训练与自主策略部署尚未验收。此处的回放执行已录制轨迹，不代表模型学会任务。
+
+- **从这里开始：[YAM 安装、录制与迁移指南](docs/yam_quickstart.md)**
+- [重力补偿测试与参数诊断](docs/yam_gravity_tests.md)
+- [手动夹爪助力、松手张开与调参（可选，待实机验证）](docs/yam_gripper_friction.md)
+- **代码 review：[改动范围、数据流程与验证方式](docs/yam_review.md)**
+- [2026-11-25 实机验证与回放误差](docs/validation/2026-11-25-yam.md)
+- [独立目录安装与无硬件复现结果](docs/validation/2026-11-25-reproduction.md)
+- [录制格式、时序与历史验证](docs/yam_rgb_collection.md)
+- [不带相机的 practice/replay](docs/yam_practice_replay.md)
+
+已验证配置：30 Hz、两路 640×480 RGB、14维关节/夹爪状态与绝对动作。
+2026-11-25 完整抓放示教及回放成功，1109行，录制实测30.004 Hz；
+使用150ms帧龄/100ms跨相机时间差的临时限值。这是流程验证，尚非长期稳定性或精度验收。
+右臂大幅前伸的自由重力补偿仍有已知不足，尚未完成全部工况验证。
+
+在已经配置好的本机环境，从本仓库根目录运行（操作员执行）：
+
+```bash
+CAMERA_MAX_AGE_MS=150 CAMERA_MAX_SKEW_MS=100 bash scripts/collect_yam.sh --duration 60
+```
+
+启动、夹爪标定、回放起点移动与退出说明见上面的YAM指南。
+默认夹爪由手动示教控制；不加 `--pick-place`。硬件映射通过本机配置设置，迁移时需重新确认。
+
+### 当前进度（2026-11-25）
+
+| 项目 | 状态 |
+| --- | --- |
+| 双臂SDK接入、手动示教、夹爪与轨迹回放 | 已完成实机流程验证 |
+| 双腕RGB与关节/夹爪数采 | 640×480、30Hz，最新任务1109条，已保存并回放 |
+| 原生数据读取 | 已验证状态/动作与双路图像引用读取 |
+| 回放误差分析 | 已提供工具、数值报告和J2/J3曲线；尚未验收任务精度 |
+| 连续多轮稳定性、新主机USB3 | 待验证；当前旧电脑运行使用临时150/100ms限值 |
+| 模型训练、自主策略部署 | 尚未验证，不能直接使用上游ARX默认任务配置 |
+
+### YAM快速使用（操作员执行）
+
+新电脑先按[YAM完整指南](docs/yam_quickstart.md)安装系统工具和uv 0.11.24，
+再从本仓库根目录运行。安装器会固定Python、全部依赖、i2rt官方提交及两处既有退出补丁：
+
+```bash
+bash scripts/setup_yam.sh
+bash scripts/check_yam.sh  # 无硬件检查；164项测试及4个subtests
+
+cp config/yam-local.env.example config/yam-local.env
+# 编辑左右相机彩色节点；按指南建立can_left/can_right的设备映射。
+nano config/yam-local.env
+source config/yam-local.env
+
+# 确认左右D405路径，以及can_left/can_right身份、1Mbit/s链路。
+# 当前旧电脑流程测试显式使用150/100ms；不设置时入口默认80/50ms。
+CAMERA_MAX_AGE_MS=150 CAMERA_MAX_SKEW_MS=100 \
+  bash scripts/collect_yam.sh --camera-only --duration 60
+
+# 相机检查通过后：完整双臂手动示教、回放、保存。
+CAMERA_MAX_AGE_MS=150 CAMERA_MAX_SKEW_MS=100 \
+  bash scripts/collect_yam.sh --duration 60
+```
+
+托稳双臂并给夹爪标定留出空间，输入 `YAM_CAPTURE_READY` 初始化。
+按 `1` 开始录制，手动控制双臂及夹爪；到时或再按 `1` 停止。
+恢复物体初始位置、让开路径后按 `r`，**双臂及夹爪会主动移到录制首帧**；
+到位后按 `1` 回放。回放后在菜单按 `1` 保存，程序返回启动姿态再撤去力矩，请托稳。
+回放中按 `1` 停止进入阻尼；异常退出按 `h` 回启动姿态，Ctrl+C原地禁用。
+
+发布数据位于 `data/yam_bimanual_30hz/episode_XXXXX.zarr`，它引用同数据集下的原始
+`data/<session>/` 视频/状态，迁移时两者都需保留。日志在 `logs/yam_capture/` 和
+`logs/replay/`。本仓库上传代码、示例相机模式和验证摘要，不包含原始实验视频/数据。
+
+软件安装与模型加载已在独立Python环境验证；新电脑实际USB/CAN映射和带载多轮验收仍需现场完成。
+重力补偿短测、三姿态测试与PD保持诊断已随仓库提供，见[测试教程](docs/yam_gravity_tests.md)。
+
+### Review建议入口
+
+按 `scripts/record_yam.py` → `src/hardware/backends/yam.py` →
+`src/contracts/standard_capture.py` → `src/recording/distributed_recording.py` 阅读。
+重点检查同一行状态/帧引用保持、夹爪坐标、暂停/停止提交边界，以及D405时钟与编码配置。
+新增/修改文件导航及测试命令见[review说明](docs/yam_review.md)。
+
+## Upstream Flash ALOHA documentation (ARX)
+
+以下保留上游ARX说明；其中ARX SDK、L5重力调参和默认训练任务不能直接用于YAM。
 
 Project website: johnyao93.github.io/flash-aloha
 
@@ -15,6 +101,8 @@ OpenPI server's policy (for example Pi0.5); see `docs/image_preprocessing.md`.
 
 The steps below are each described in their own section. Commands that move a robot
 are marked operator-run: read the section before running them.
+
+YAM Ultra 2 users should follow [the YAM guide](docs/yam_quickstart.md).
 
 ```bash
 # 1. Install and run the offline tests (no robot needed)

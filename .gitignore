@@ -1,4 +1,9 @@
 .venv/
+.venv-yam/
+.venv-bootstrap/
+.yam-deps/
+config/yam-local.env
+config/yam-gripper-friction.json
 .venv-pi/
 __pycache__/
 *.py[cod]

@@ -1,0 +1,21 @@
+--- a/robologger/loggers/video_logger.py
++++ b/robologger/loggers/video_logger.py
+@@ -109,11 +109,17 @@
+                       "-pix_fmt",
+                       "yuv420p",
+                       "-preset",
+-                      "fast",
++                      config.get("encoder_preset", "fast"),
+                       "-b:v",
+                       "5M",
+                       mp4_file_path,
+                   ]
++                if config.get("encoder_threads") is not None:
++                    ffmpeg_cmd[-1:-1] = ["-threads", str(config["encoder_threads"])]
++                if config.get("encoder_tune"):
++                    ffmpeg_cmd[-1:-1] = ["-tune", str(config["encoder_tune"])]
++                if config.get("filter_threads") is not None:
++                    ffmpeg_cmd[1:1] = ["-filter_threads", str(config["filter_threads"])]
+                 self.ffmpeg_processes[cam_name] = subprocess.Popen(
+                     ffmpeg_cmd,
+                     stdin=subprocess.PIPE,

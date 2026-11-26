@@ -1,0 +1,52 @@
+--- a/i2rt/motor_drivers/dm_driver.py
++++ b/i2rt/motor_drivers/dm_driver.py
+@@ -783,7 +783,26 @@
+         self.running = False
+         if hasattr(self, "_control_thread") and self._control_thread.is_alive():
+             self._control_thread.join(timeout=2.0)
+-        self.motor_interface.close()
++        # A DM motor retains the last MIT command until it receives DISABLE or
++        # its communication timeout expires.  Stop the writer first, then
++        # explicitly disable every motor before releasing the CAN socket.
++        disable_failures = []
++        try:
++            self.motor_interface._drain_bus(timeout_s=0.05)
++            for motor_id, _motor_type in self.motor_list:
++                try:
++                    self.motor_interface.motor_off(motor_id)
++                except Exception as exc:
++                    disable_failures.append((motor_id, exc))
++                    logger.exception("Failed to disable motor %s during chain close", motor_id)
++        finally:
++            self.motor_interface.close()
++
++        if disable_failures:
++            failed_ids = [motor_id for motor_id, _exc in disable_failures]
++            raise RuntimeError(
++                f"failed to confirm DISABLE for motor(s) {failed_ids}; use the emergency stop or remove motor power"
++            )
+ 
+ 
+ class MultiDMChainCanInterface(MotorChain):
+--- a/i2rt/robots/motor_chain_robot.py
++++ b/i2rt/robots/motor_chain_robot.py
+@@ -819,7 +819,18 @@
+ 
+     def close(self) -> None:
+         """Safely close the robot by setting all torques to zero."""
+-        # self.move_to_zero()
++        # Send an explicit zero-torque/zero-gain frame before stopping the
++        # control threads.  Closing the host CAN socket alone does not disable
++        # a DM motor immediately: it may keep applying the last MIT command
++        # until its configured communication timeout expires.
++        if self.motor_chain.running:
++            try:
++                self.enter_zero_torque_idle()
++                # Allow several control cycles to put the release command on
++                # every motor before the server and CAN loops are stopped.
++                time.sleep(0.05)
++            except Exception:
++                logger.exception("Failed to send the zero-torque release command during robot close")
+         self._stop_event.set()  # Signal the thread to stop
+         self._server_thread.join()  # Wait for the thread to finish
+         try:

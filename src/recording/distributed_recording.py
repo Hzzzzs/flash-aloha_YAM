@@ -327,14 +327,38 @@ class ControlWriter:
         return self.datasets[name]
 
     def append(self, sample: dict[str, Any]) -> None:
+        self.append_many([sample])
+
+    def append_many(self, samples: list[dict[str, Any]]) -> None:
+        """Commit queued rows together, without changing their order or references."""
+        if not samples:
+            return
+        rows = [self._sample_values(sample, self.count + offset)
+                for offset, sample in enumerate(samples)]
+        names = set(rows[0])
+        if any(set(row) != names for row in rows):
+            raise RecorderError('Control fields changed within a write batch')
+        # Validate shapes before any array grows. count only means committed rows.
+        columns = {}
+        for name, (_, dtype) in rows[0].items():
+            columns[name] = (np.stack([row[name][0] for row in rows]).astype(dtype), dtype)
+        end = self.count + len(rows)
+        for name, (column, dtype) in columns.items():
+            dataset = self._dataset(name, column[0], dtype)
+            dataset.resize((end, *column.shape[1:]))
+            dataset[self.count:end] = column
+        self.count = end
+
+    def _sample_values(self, sample: dict[str, Any], index: int) -> dict:
         require_absolute_actions(sample)
-        if not self.count:
+        if not index:
             self.group.attrs["action_command_style"] = "absolute"
-        if self.count and sample.get('capture_contract_version') != self.group.attrs.get('capture_contract_version'):
+        if index and sample.get('capture_contract_version') != self.group.attrs.get('capture_contract_version'):
             raise RecorderError('Capture contract version cannot change within a control stream')
         if sample.get('capture_contract_version') is not None:
             validate_capture_payload(sample, sample['camera_observation']['cameras'], limits=self.capture_limits)
-            self.group.attrs['capture_contract_version'] = CAPTURE_CONTRACT_VERSION
+            if not index:
+                self.group.attrs['capture_contract_version'] = CAPTURE_CONTRACT_VERSION
         required = ("timestamp", "qpos", "qvel", "commanded_action")
         missing = [name for name in required if name not in sample]
         if missing:
@@ -382,27 +406,23 @@ class ControlWriter:
                 values[name] = (np.asarray(sample[name]), np.float64)
         observation = sample.get('camera_observation')
         has_references = 'camera_observation' in self.group
-        if self.count and bool(observation) != has_references:
+        if index and bool(observation) != has_references:
             raise RecorderError('Camera references must be present for every control sample, or none in a legacy stream')
         if observation:
             names = list(observation['cameras'])
             group = self.group.require_group('camera_observation')
-            if self.count and set(group.attrs['camera_names']) != set(names):
+            if index and set(group.attrs['camera_names']) != set(names):
                 raise RecorderError('Camera reference names changed during recording')
-            group.attrs.update(camera_names=names, alignment_rule='selected_consumer_frame_ids')
-            if sample.get('capture_contract_version') is not None:
-                group.attrs['capture_contract_version'] = CAPTURE_CONTRACT_VERSION
+            if not index:
+                group.attrs.update(camera_names=names, alignment_rule='selected_consumer_frame_ids')
+                if sample.get('capture_contract_version') is not None:
+                    group.attrs['capture_contract_version'] = CAPTURE_CONTRACT_VERSION
             values['camera_observation/snapshot_timestamp'] = (np.asarray(observation['snapshot_timestamp']), np.float64)
             for name, reference in observation['cameras'].items():
                 for field, dtype in (('frame_number', np.int64), ('capture_timestamp', np.float64),
                                      ('consumer_received_timestamp', np.float64)):
                     values[f'camera_observation/{name}/{field}'] = (np.asarray(reference[field]), dtype)
-        for name, (value, dtype) in values.items():
-            value = np.asarray(value, dtype=dtype)
-            dataset = self._dataset(name, value, dtype)
-            dataset.resize((self.count + 1, *value.shape))
-            dataset[self.count] = value
-        self.count += 1
+        return values
 
     def append_action_chunk(self, payload: dict[str, Any]) -> None:
         group = self.group.require_group("inference_chunks")
@@ -452,7 +472,7 @@ def _coordinator_main(
 
     def drain_control_samples(
         *,
-        max_items: int | None = 128,
+        max_items: int | None = 8,
         expected_count: int | None = None,
         timeout: float = 0.0,
     ) -> None:
@@ -468,8 +488,9 @@ def _coordinator_main(
             return
         deadline = time.monotonic() + max(0.0, float(timeout))
         drained = 0
+        pending = []
         while max_items is None or drained < max_items:
-            if expected_count is not None and writer.count >= expected_count:
+            if expected_count is not None and writer.count + len(pending) >= expected_count:
                 break
             try:
                 if expected_count is not None and time.monotonic() < deadline:
@@ -479,7 +500,7 @@ def _coordinator_main(
                 else:
                     sample = control_queue.get_nowait()
             except queue.Empty:
-                if expected_count is not None and writer.count < expected_count:
+                if expected_count is not None and writer.count + len(pending) < expected_count:
                     if time.monotonic() < deadline:
                         continue
                     raise RecorderError(
@@ -487,19 +508,22 @@ def _coordinator_main(
                         f"committed={writer.count}, expected={expected_count}"
                     )
                 break
-            if writer.count == 0:
+            if writer.count == 0 and not pending:
                 manifest["first_active_control_timestamp"] = float(sample["timestamp"])
             if config.get('capture_contract_version'):
                 validate_capture_payload(sample, config['camera_names'],
                                          limits=TimingLimits(**config['timing_limits']))
-            writer.append(sample)
+            pending.append(sample)
+            drained += 1
+        first_index = writer.count
+        writer.append_many(pending)
+        for offset, sample in enumerate(pending):
             if collection_stream is not None:
                 max_control_write_delay = max(max_control_write_delay, time.monotonic() - sample["timestamp"])
                 collection_stream.write(json.dumps(_json_value(dict(
-                    raw_index=writer.count - 1, label=sample.get("collection_label", {})))) + "\n")
-                if writer.count % 100 == 0:
+                    raw_index=first_index + offset, label=sample.get("collection_label", {})))) + "\n")
+                if (first_index + offset + 1) % 100 == 0:
                     collection_stream.flush()
-            drained += 1
         manifest["sample_count"] = writer.count
 
     try:
@@ -1122,8 +1146,10 @@ def publish_recording(manifest_path: str | Path) -> list[str]:
             target /= str(decision)
         metadata = dict(manifest.get('metadata') or {}, sim=False,
             rollout=kind == 'rollout', dagger=kind == 'dagger', recording_decision=decision,
-            failure=decision == 'failure', robot_type='arx', robot_model='L5',
+            failure=decision == 'failure',
             single_arm=not manifest['is_double_arm'], double_arm=manifest['is_double_arm'])
+        metadata.setdefault('robot_type', 'arx')
+        metadata.setdefault('robot_model', 'L5')
         arrays = {}
         if kind == 'dagger':
             segments = np.asarray(control['segment_id'])

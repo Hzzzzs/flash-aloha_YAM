@@ -1,0 +1,16 @@
+{
+  "repository": "https://github.com/i2rt-robotics/i2rt.git",
+  "commit": "ea116fe4079e991958b22f879874402674ee6590",
+  "version": "1.1.2",
+  "patch": "i2rt-explicit-motor-disable.patch",
+  "files": {
+    "i2rt/motor_drivers/dm_driver.py": {
+      "upstream_sha256": "e4cfc9d303fff821c1e642dc11c471fa45489e22c6f4896e23c57a5fd799e319",
+      "patched_sha256": "3d16e2b0f2f2a1de7f92129c2000ffbc1b3ad48870ec9976866087cd127ad189"
+    },
+    "i2rt/robots/motor_chain_robot.py": {
+      "upstream_sha256": "0bd2ba56782616eccd2ac03133fc98944ff5664b302b49c1612e4ff9d07cf6d2",
+      "patched_sha256": "a33ffaee16beab9abe9a1dbc6edf6eacc3c4a4c316b3b26724fb4a234960ddfc"
+    }
+  }
+}

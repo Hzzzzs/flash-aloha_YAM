@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pedal-driven record/replay test for one or both ARX arms.
+"""Pedal-driven record/replay test for one or both ARX or YAM arms.
 
 No task, no cameras, no time limit, no episode written. The take is kept in
 memory until the next recording replaces it.
@@ -22,8 +22,8 @@ With --graph, each replay that played is followed by a window graphing the
 commanded and achieved position of every joint, drawn from that replay's
 tracking log by a separate process.
 
-This is an operator of the collector's own pieces, used unchanged: the ARX
-backend, `standard_capture` via `EpisodeCapture`, and the collector's review
+This is an operator of the collector's own pieces, used unchanged: the selected
+robot backend, `standard_capture` via `EpisodeCapture`, and the collector's review
 replay (`recording_replay.replay_take`), including its tracking log under
 logs/replay and its failure exit (damping until `h`, then home).
 """
@@ -143,19 +143,28 @@ def replay_in_memory_take(backend, samples, gains, read_key, graphs=None):
     return result
 
 
-def build_context(arms, *, fps, can_left, can_right, start_position_path, move_duration):
-    from recording.record_episode_single import RunContext
+def build_context(arms, *, robot, fps, can_left, can_right, start_position_path, move_duration,
+                  i2rt_root=None, gripper_force_n=5.0):
+    if robot == 'yam':
+        from recording.practice_support import RunContext
+    else:
+        from recording.record_episode_single import RunContext
     both = arms == 'both'
     return RunContext(
         task_name='replay_practice', dataset_dir='', max_timesteps=0, camera_names=[],
-        robot_type='arx', single_arm=not both, double_arm=both,
+        robot_type=robot, single_arm=not both, double_arm=both,
         # In single-arm mode the backend drives `can_interface_left` as the active arm.
         can_interface_left=can_left if arms != 'right' else can_right,
         can_interface_right=can_right if both else None,
         arx_single_arm_side=None if both else arms,
         fps=float(fps), use_start_position=start_position_path is not None,
         start_position_path=start_position_path,
-        start_position_move_duration=float(move_duration))
+        start_position_move_duration=float(move_duration),
+        robot_contract={'robot_contract_version': 1, 'arms': {
+            role: {'model': 'yam_ultra_2' if robot == 'yam' else 'L5'}
+            for role in (('left', 'right') if both else (arms,))}},
+        hardware_config=({'i2rt_root': i2rt_root, 'gripper_force_n': float(gripper_force_n)}
+                         if robot == 'yam' else None))
 
 
 def record_take(backend, read_key, *, fps, make_capture, notify=print):
@@ -214,10 +223,16 @@ def run(backend, read_key, *, fps, make_capture, replay, gains=None, notify=prin
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--robot', choices=['arx', 'yam'], default='arx',
+                        help='Robot backend (default: arx).')
     parser.add_argument('--arms', choices=['left', 'right', 'both'], required=True)
     parser.add_argument('--fps', type=float, default=100.0, help='Proprio sample and replay rate (default: 100).')
-    parser.add_argument('--can-left', default=ARX_SINGLE_ARM_CAN_BY_SIDE['left'])
-    parser.add_argument('--can-right', default=ARX_SINGLE_ARM_CAN_BY_SIDE['right'])
+    parser.add_argument('--can-left', default=None, help='Default: ARX can0; YAM can_left.')
+    parser.add_argument('--can-right', default=None, help='Default: ARX can1; YAM can_right.')
+    parser.add_argument('--i2rt-root', default=None,
+                        help='i2rt checkout (default: $I2RT_ROOT or sibling ../i2rt).')
+    parser.add_argument('--gripper-force-n', type=float, default=5.0,
+                        help='YAM gripper force limit in newtons (default: 5).')
     parser.add_argument('--start-position', dest='start_position_path', nargs='?', default=None,
                         const='calibration/start_position.npz',
                         help='Move to this saved start pose first; without it the arms go passive where they are.')
@@ -234,18 +249,27 @@ def build_arg_parser():
 
 def main(args):
     from hardware.safe_exit import QuitRequested, damping_exit, raising_signals
-    from recording.record_episode_single import ARXBackend, EpisodeCapture, home_key_pressed, read_key_nonblocking
-    ctx = build_context(args.arms, fps=args.fps, can_left=args.can_left, can_right=args.can_right,
+    if args.robot == 'yam' and (not np.isfinite(args.gripper_force_n)
+                                or not 0 < args.gripper_force_n <= 25):
+        raise ValueError('--gripper-force-n must be finite and in (0, 25]')
+    can_left = args.can_left or ('can_left' if args.robot == 'yam' else ARX_SINGLE_ARM_CAN_BY_SIDE['left'])
+    can_right = args.can_right or ('can_right' if args.robot == 'yam' else ARX_SINGLE_ARM_CAN_BY_SIDE['right'])
+    ctx = build_context(args.arms, robot=args.robot, fps=args.fps, can_left=can_left, can_right=can_right,
                         start_position_path=args.start_position_path, move_duration=args.move_duration)
-    print(f'[Config] arms={args.arms} fps={ctx.fps:g} cameras=none; no episode is saved')
+    if args.robot == 'yam':
+        ctx.hardware_config = {'i2rt_root': args.i2rt_root,
+                               'gripper_force_n': float(args.gripper_force_n)}
+    print(f'[Config] robot={args.robot} arms={args.arms} fps={ctx.fps:g} cameras=none; no episode is saved')
     backend = None
     failed = False
-    try:
+
+    def operate(backend_type, capture_type, read_key, home_requested):
+        nonlocal backend
         with raising_signals():
             # Any failure, including Ctrl+C, damps until 'h', homes, then exits.
             with damping_exit(lambda: None if backend is None else backend.damping_target(),
-                              home_requested=home_key_pressed):
-                backend = ARXBackend(ctx)
+                              home_requested=home_requested):
+                backend = backend_type(ctx)
                 backend.setup_for_recording()
                 backend.enable_passive_compensation()  # Practice starts with the arms released.
                 gains = ReplayGains(args.kp_scale, args.kd_scale)
@@ -253,12 +277,23 @@ def main(args):
                 replay = replay_in_memory_take if graphs is None else (
                     lambda *replay_args: replay_in_memory_take(*replay_args, graphs=graphs))
                 try:
-                    run(backend, read_key_nonblocking, fps=ctx.fps, make_capture=EpisodeCapture,
+                    run(backend, read_key, fps=ctx.fps, make_capture=capture_type,
                         replay=replay, gains=gains)
                 finally:
                     print(f'Last used. {gains}')
                     if graphs is not None:
                         graphs.close()
+
+    try:
+        if args.robot == 'yam':
+            from hardware.backends.yam import YAMBackend
+            from recording.practice_support import EpisodeCapture, TerminalKeyWatcher
+            with TerminalKeyWatcher() as keys:
+                operate(YAMBackend, EpisodeCapture, keys.poll, keys.home_requested)
+        else:
+            from recording.record_episode_single import (
+                ARXBackend, EpisodeCapture, home_key_pressed, read_key_nonblocking)
+            operate(ARXBackend, EpisodeCapture, read_key_nonblocking, home_key_pressed)
     except QuitRequested:
         pass
     except BaseException:
